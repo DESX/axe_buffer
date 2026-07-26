@@ -1,25 +1,25 @@
 # axe_buffer
 
-Single-header C++20 single-writer / many-reader (SPMC) broadcast ring. One writer
-appends fixed-capacity FIFO items; many readers each observe the full stream
-independently. When the ring fills, new items overwrite the oldest. Readers are
-wait-free and passive: they never block the writer and never mutate shared state
-beyond their own cursor. Torn reads are detected rather than prevented, via a
-seqlock over two monotonic counters.
+Single-header C++20 single-producer, multi-consumer (SPMC) broadcast ring. One
+writer appends fixed-capacity FIFO items; many readers each observe the full
+stream independently. When the ring fills, new items overwrite the oldest.
+Readers are wait-free and passive: they never block the writer and never mutate
+shared state beyond their own cursor. Torn reads are detected rather than
+prevented, via a seqlock over two monotonic counters.
 
 Requires C++20 (`std::atomic_ref`, `std::move_if_noexcept`). No dependencies
 beyond the standard library.
 
 ## Features
 
-* [Broadcast SPMC ring](#broadcast-spmc-ring)
-* [Wait-free passive readers](#wait-free-passive-readers)
-* [Overwrite with lap detection](#overwrite-with-lap-detection)
-* [Batched writes](#batched-writes)
-* [Consistent snapshots](#consistent-snapshots)
-* [Non-trivial element types (Tier B)](#non-trivial-element-types-tier-b)
-* [Temporal safety tools](#temporal-safety-tools)
-* [Counter core and configuration](#counter-core-and-configuration)
+* [Broadcast SPMC ring](#broadcast-spmc-ring): fixed capacity, one writer, many independent readers
+* [Wait-free passive readers](#wait-free-passive-readers): readers hold only a cursor, never block the writer
+* [Overwrite with lap detection](#overwrite-with-lap-detection): a full ring drops the oldest; slow readers get `lapped`
+* [Batched writes](#batched-writes): reserve N slots, fill them, commit atomically on scope exit
+* [Consistent snapshots](#consistent-snapshots): coherent oldest-to-newest copy of the live window
+* [Non-trivial element types (Tier B)](#non-trivial-element-types-tier-b): store any type, read it by reference
+* [Temporal safety tools](#temporal-safety-tools): decline reads too close to the overwrite edge
+* [Counter core and configuration](#counter-core-and-configuration): wrap-safe counters, configurable word width
 
 ## Usage
 
