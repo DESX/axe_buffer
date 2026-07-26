@@ -23,8 +23,7 @@ using namespace axe;
 // and tries to print it by dereferencing mod_int (which isn't an iterator).
 // Opt it out of range-stringification; it falls back to "{?}" on failure.
 namespace Catch {
-template <typename W, W M>
-struct is_range<axe::mod_range<W, M>> : std::false_type {};
+template <typename W, W M> struct is_range<axe::mod_range<W, M>> : std::false_type {};
 } // namespace Catch
 
 //=============================================================================
@@ -192,9 +191,7 @@ struct sample {
   uint64_t seq;
   uint64_t chk;
 };
-static uint64_t mix(uint64_t s) {
-  return (s * 0x9E3779B97F4A7C15ull) ^ (s << 7) ^ 0xA5A5A5ull;
-}
+static uint64_t mix(uint64_t s) { return (s * 0x9E3779B97F4A7C15ull) ^ (s << 7) ^ 0xA5A5A5ull; }
 
 TEST_CASE("SPMC stress: 1 writer + N readers") {
   constexpr size_t S = 64;
@@ -321,8 +318,7 @@ TEST_CASE("non-trivial T: multi-slot lock across warmup->full boundary") {
       for (auto s : w)
         s.emplace(n++);
     }
-    REQUIRE(Counted::live.load() ==
-            4); // exactly S live: no leak, no double-construct
+    REQUIRE(Counted::live.load() == 4); // exactly S live: no leak, no double-construct
 
     // Live window is the last 4: positions 2,3,4,5 -> values 2,10,11,12.
     auto win = buf.unsafe_window();
@@ -441,8 +437,7 @@ TEST_CASE("multi-segment view") {
   d[0] = {a, sizeof(a)};
   d[1] = {b, sizeof(b)};
   REQUIRE(d.size() == 8);
-  REQUIRE(d.to_vec() ==
-          (std::vector<char>{'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'}));
+  REQUIRE(d.to_vec() == (std::vector<char>{'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'}));
 }
 
 //----------------------------------------------------------------------------

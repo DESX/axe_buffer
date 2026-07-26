@@ -70,9 +70,10 @@ lint lint-fix: $(TC_TGT) $(CLANG_TGT)
 	$(TIDY) $(TIDY_FLAGS) --config-file=$(TC_TGT) --warnings-as-errors='-*' axe_buffer.hpp -- -std=c++20 -x c++ -Wno-pragma-once-outside-header
 
 # Style passed inline — no .clang-format anywhere. Override e.g. `make format STYLE=Google`.
-STYLE ?= LLVM
+STYLE ?= "{BasedOnStyle: LLVM, ColumnLimit: 100}"
 format: $(CLANG_TGT)            # rewrite SRCS in place
 	$(FMT) -i --style=$(STYLE) $(SRCS)
+
 format-check: $(CLANG_TGT)      # report drift, non-zero exit; no changes
 	$(FMT) --dry-run --Werror --style=$(STYLE) $(SRCS)
 

@@ -18,8 +18,7 @@ namespace axe {
 
 // Distance from `limit` up to the next multiple of `v` above it.
 template <typename T>
-constexpr T max_multiple_inv(const T v,
-                             const T limit = std::numeric_limits<T>::max()) {
+constexpr T max_multiple_inv(const T v, const T limit = std::numeric_limits<T>::max()) {
   auto ret = (limit - v + 1) % v;
   return ret == 0 ? v : ret;
 }
@@ -36,8 +35,7 @@ template <typename T> constexpr bool is_power_of_2(const T val) {
 // Largest multiple of `v` <= `limit`; 0 for v==0 or power-of-two v (caller then
 // relies on natural integer overflow).
 template <typename T>
-constexpr T max_multiple(const T v,
-                         const T limit = std::numeric_limits<T>::max()) {
+constexpr T max_multiple(const T v, const T limit = std::numeric_limits<T>::max()) {
   if (v == 0)
     return 0;
   else if (is_power_of_2(v))
@@ -103,12 +101,8 @@ public:
   }
 
   constexpr bool operator==(const INT_TYPE rhs) const { return val_ == rhs; }
-  constexpr bool operator==(const mod_int rhs) const {
-    return val_ == rhs.val_;
-  }
-  constexpr bool operator!=(const mod_int rhs) const {
-    return val_ != rhs.val_;
-  }
+  constexpr bool operator==(const mod_int rhs) const { return val_ == rhs.val_; }
+  constexpr bool operator!=(const mod_int rhs) const { return val_ != rhs.val_; }
 
 private:
   INT_TYPE val_;
@@ -116,8 +110,7 @@ private:
 
 // Signed cyclic distance a→b, in (-mod/2, mod/2].
 template <typename INT_TYPE, INT_TYPE mod_val>
-constexpr auto signed_distance(mod_int<INT_TYPE, mod_val> a,
-                               mod_int<INT_TYPE, mod_val> b)
+constexpr auto signed_distance(mod_int<INT_TYPE, mod_val> a, mod_int<INT_TYPE, mod_val> b)
     -> std::make_signed_t<INT_TYPE> {
   using S = std::make_signed_t<INT_TYPE>;
   if constexpr (mod_val == 0) {
@@ -169,9 +162,7 @@ public:
   constexpr bool empty() const { return begin_ == end_; }
 
   constexpr value_t at(INT_TYPE i) const { return begin_ + value_t(i); }
-  constexpr bool contains(value_t p) const {
-    return (p - begin_).val() < size();
-  }
+  constexpr bool contains(value_t p) const { return (p - begin_).val() < size(); }
   constexpr INT_TYPE offset(value_t p) const { return (p - begin_).val(); }
 
   constexpr mod_range advanced_begin(INT_TYPE n) const {
@@ -210,9 +201,7 @@ public:
   data_view(T *a, size_t s) : begin_(a), end_(a + s) {}
   data_view(T *a, T *b) : begin_(a), end_(b) {}
 
-  size_t size() const {
-    return (end_ && begin_) ? static_cast<size_t>(end_ - begin_) : 0;
-  }
+  size_t size() const { return (end_ && begin_) ? static_cast<size_t>(end_ - begin_) : 0; }
   T *begin() const { return begin_; }
   T *end() const { return end_; }
 
@@ -252,15 +241,13 @@ enum class read_result { ok, empty, lapped };
 template <typename T, size_t S, typename word_t = uint64_t> class axe_buffer {
   static_assert(S > 0, "axe_buffer size must be > 0");
   static_assert(std::is_unsigned_v<word_t>, "counter type must be unsigned");
-  static_assert(
-      S <= static_cast<size_t>(std::numeric_limits<word_t>::max()) / 2,
-      "S too large for word_t (the counters need a modulus of at least 2S)");
+  static_assert(S <= static_cast<size_t>(std::numeric_limits<word_t>::max()) / 2,
+                "S too large for word_t (the counters need a modulus of at least 2S)");
 
   // Both counters run over the same modulus: the largest multiple of S that
   // fits word_t (0 ⇒ natural overflow, for power-of-two S), so pos % S stays
   // exact.
-  static constexpr word_t M =
-      static_cast<word_t>(max_multiple<word_t>(static_cast<word_t>(S)));
+  static constexpr word_t M = static_cast<word_t>(max_multiple<word_t>(static_cast<word_t>(S)));
   using added_t = mod_int<word_t, M>;
   using range_t = mod_range<word_t, M>; // [freed, added)
 
@@ -306,8 +293,7 @@ public:
 
     const size_t sz = live.size();
     const bool was_full = (sz == S);
-    const size_t need_free =
-        (sz + n > S) ? (sz + n - S) : 0; // 0 until the ring fills
+    const size_t need_free = (sz + n > S) ? (sz + n - S) : 0; // 0 until the ring fills
     if (need_free) {
       // Free-before-write: publish the freed advance (release) BEFORE any cell
       // it frees is overwritten, and fence so the cell writes can't reorder
@@ -327,16 +313,13 @@ public:
 
   class slot_proxy {
   public:
-    slot_proxy(axe_buffer &b, size_t idx, bool reuse)
-        : buf_(b), idx_(idx), reuse_(reuse) {}
+    slot_proxy(axe_buffer &b, size_t idx, bool reuse) : buf_(b), idx_(idx), reuse_(reuse) {}
 
     template <typename... Args> T &emplace(Args &&...args) {
       return buf_.construct_cell(idx_, reuse_, std::forward<Args>(args)...);
     }
 
-    template <typename U> T &operator=(U &&v) {
-      return emplace(std::forward<U>(v));
-    }
+    template <typename U> T &operator=(U &&v) { return emplace(std::forward<U>(v)); }
 
   private:
     axe_buffer &buf_;
@@ -378,8 +361,7 @@ public:
 
     // Move-only: owns the writer mutex and the commit obligation.
     writer_range(writer_range &&o) noexcept
-        : buf_(o.buf_), span_(o.span_), was_full_(o.was_full_),
-          committed_(o.committed_) {
+        : buf_(o.buf_), span_(o.span_), was_full_(o.was_full_), committed_(o.committed_) {
       o.buf_ = nullptr;
     }
     writer_range(const writer_range &) = delete;
@@ -415,8 +397,7 @@ public:
   class reader {
   public:
     explicit reader(axe_buffer &b) : buf_(&b) {
-      pos_ = added_t(
-          buf_->freed_.load(std::memory_order_acquire)); // start at oldest
+      pos_ = added_t(buf_->freed_.load(std::memory_order_acquire)); // start at oldest
     }
 
     // ok: out written, cursor advanced. empty: caught up. lapped: freed crossed
@@ -439,8 +420,7 @@ public:
 
       const size_t idx = pos_.val() % S;
       atomic_load_bytes(&out, buf_->cells_[idx].mem, sizeof(T));
-      std::atomic_thread_fence(
-          std::memory_order_acquire); // copy before the freed load
+      std::atomic_thread_fence(std::memory_order_acquire); // copy before the freed load
       const added_t freed{buf_->freed_.load(std::memory_order_relaxed)};
 
       if (signed_distance(freed, pos_) < 0) {
@@ -461,20 +441,16 @@ public:
   // Consistent oldest-to-newest copy of the live window. Trivially-copyable T
   // only.
   std::vector<T> snapshot() const {
-    static_assert(
-        std::is_trivially_copyable_v<T>,
-        "snapshot requires trivially-copyable T; use unsafe_window otherwise");
+    static_assert(std::is_trivially_copyable_v<T>,
+                  "snapshot requires trivially-copyable T; use unsafe_window otherwise");
     for (;;) {
-      const word_t f1 =
-          freed_.load(std::memory_order_acquire); // read freed first
-      const added_t added{
-          added_.load(std::memory_order_acquire)}; // ⇒ added >= f1
+      const word_t f1 = freed_.load(std::memory_order_acquire);    // read freed first
+      const added_t added{added_.load(std::memory_order_acquire)}; // ⇒ added >= f1
       const range_t live(added_t(f1), added);
       std::vector<T> out(live.size());
       for (word_t k = 0; k < live.size(); ++k)
         atomic_load_bytes(&out[k], cells_[live.at(k).val() % S].mem, sizeof(T));
-      std::atomic_thread_fence(
-          std::memory_order_acquire); // copy before the freed recheck
+      std::atomic_thread_fence(std::memory_order_acquire); // copy before the freed recheck
       // freed unchanged ⇒ no copied cell was freed/overwritten during the copy.
       if (freed_.load(std::memory_order_relaxed) == f1)
         return out;
@@ -525,23 +501,19 @@ private:
     auto *d = static_cast<unsigned char *>(dst);
     auto *s = static_cast<const unsigned char *>(src);
     for (size_t i = 0; i < n; ++i)
-      std::atomic_ref<unsigned char>(d[i]).store(s[i],
-                                                 std::memory_order_relaxed);
+      std::atomic_ref<unsigned char>(d[i]).store(s[i], std::memory_order_relaxed);
   }
   static void atomic_load_bytes(void *dst, const void *src, size_t n) {
     auto *d = static_cast<unsigned char *>(dst);
-    auto *s =
-        const_cast<unsigned char *>(static_cast<const unsigned char *>(src));
+    auto *s = const_cast<unsigned char *>(static_cast<const unsigned char *>(src));
     for (size_t i = 0; i < n; ++i)
-      d[i] =
-          std::atomic_ref<unsigned char>(s[i]).load(std::memory_order_relaxed);
+      d[i] = std::atomic_ref<unsigned char>(s[i]).load(std::memory_order_relaxed);
   }
 
   // Trivially-copyable T: race-free byte store (trivial dtor, nothing to
   // destroy). Non-trivial T: placement-new, destroying the prior object first
   // when reused.
-  template <typename... Args>
-  T &construct_cell(size_t idx, bool reuse, Args &&...args) {
+  template <typename... Args> T &construct_cell(size_t idx, bool reuse, Args &&...args) {
     if constexpr (std::is_trivially_copyable_v<T>) {
       (void)reuse;
       T tmp(std::forward<Args>(args)...);
