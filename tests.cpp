@@ -141,6 +141,49 @@ TEST_CASE("reader cursor: ok / empty / lapped") {
 }
 
 //----------------------------------------------------------------------------
+// EXAMPLE 3b — temporal tools: remaining_writes() reports an item's headroom in
+// writes, and the guarded read read(out, min_margin) declines items too close
+// to the overwrite edge with would_overwrite instead of handing them back. The
+// library holds no clock: the margin is in writes, and the caller converts its
+// own time budget (see DESIGN.md §3).
+//----------------------------------------------------------------------------
+TEST_CASE("temporal: remaining_writes + guarded read") {
+  constexpr size_t S = 8;
+  axe_buffer<int, S> buf;
+  for (int i = 0; i < 8; ++i)
+    buf.push_back(i); // full: freed=0, added=8, so item i sits at depth i
+
+  auto r = buf.new_reader(); // cursor at the oldest (depth 0)
+  int x;
+
+  // Oldest item has zero headroom; a request for any positive margin is
+  // declined, and declining leaves the cursor exactly where it was.
+  REQUIRE(r.remaining_writes() == 0);
+  REQUIRE(r.read(x, 1) == read_result::would_overwrite);
+  REQUIRE(r.remaining_writes() == 0);
+  REQUIRE((r.read(x, 0) == read_result::ok && x == 0)); // margin 0 is satisfiable
+
+  // Walking forward, item i has depth i: margin i is accepted, i+1 declined.
+  for (int i = 1; i < 8; ++i) {
+    REQUIRE(r.remaining_writes() == i);
+    REQUIRE(r.read(x, static_cast<uint64_t>(i) + 1) == read_result::would_overwrite);
+    REQUIRE((r.read(x, static_cast<uint64_t>(i)) == read_result::ok && x == i));
+  }
+  REQUIRE(r.read(x, 0) == read_result::empty); // caught up
+
+  // would_overwrite is an early warning distinct from lapped: as the writer
+  // advances, the same item crosses from "too close" to "already gone".
+  axe_buffer<int, 4> b2;
+  for (int i = 0; i < 4; ++i)
+    b2.push_back(i);
+  auto r2 = b2.new_reader();                            // oldest, depth 0
+  REQUIRE(r2.read(x, 2) == read_result::would_overwrite); // 0 < 2: declined, not consumed
+  b2.push_back(4);                                        // freed advances past the cursor
+  REQUIRE(r2.read(x, 2) == read_result::lapped);          // now genuinely gone; resynced
+  REQUIRE(r2.remaining_writes() == 0);                    // cursor sits at the new oldest
+}
+
+//----------------------------------------------------------------------------
 // EXAMPLE 4 — multi-slot writer_lock(N) + iterator emplace.
 //----------------------------------------------------------------------------
 TEST_CASE("multi-slot writer_lock + iterator emplace") {
@@ -329,6 +372,141 @@ TEST_CASE("non-trivial T: multi-slot lock across warmup->full boundary") {
     REQUIRE(got == (std::vector<int>{2, 10, 11, 12}));
   }
   REQUIRE(Counted::live.load() == 0); // teardown destroyed all live cells
+}
+
+//=============================================================================
+// TIER-B LIFETIME SAFETY (commit accounting)
+//
+// commit() publishes only the contiguous prefix of slots actually constructed,
+// and teardown destroys the explicit constructed prefix — so neither a partial
+// fill nor an exception mid-lock ever publishes or destroys an unwritten cell.
+// Both cases assert the invariant that makes this safe: the buffer's live-object
+// count is conserved across construction and teardown.
+//
+// These began as [!shouldfail] demonstrations of the pre-fix defects; the tag is
+// gone now that the library upholds the invariant. If either regresses it fails
+// loudly rather than silently passing.
+//
+// Tracer has its own live counter (independent of Counted) and each case
+// measures the delta around a scoped buffer, so the cases stay hermetic even
+// under randomised test ordering.
+//----------------------------------------------------------------------------
+struct Tracer {
+  static std::atomic<int> live;
+  static constexpr int kBoom = 99; // sentinel value whose ctor throws
+  int v;
+  Tracer(int x = 0) : v(x) {
+    if (x == kBoom)
+      throw std::runtime_error("Tracer ctor boom");
+    live.fetch_add(1);
+  }
+  Tracer(const Tracer &o) : v(o.v) { live.fetch_add(1); }
+  Tracer &operator=(const Tracer &o) {
+    v = o.v;
+    return *this;
+  }
+  ~Tracer() { live.fetch_sub(1); }
+};
+std::atomic<int> Tracer::live{0};
+
+//----------------------------------------------------------------------------
+// A throwing element constructor on a fresh slot mid-lock must not corrupt the
+// buffer. writer_lock(3) reserves three tail slots; the second emplace throws.
+// Stack unwinding runs ~writer_range, which now publishes only the one slot
+// actually constructed, and teardown destroys exactly the constructed prefix —
+// so the throwing/unwritten slots are never destroyed and the live count is
+// conserved. (The throw is on a fresh, non-reused slot; a throw during an
+// in-place reuse is a separate Tier-B contract — see DESIGN.md.)
+//----------------------------------------------------------------------------
+TEST_CASE("throwing ctor mid-lock must not corrupt the buffer") {
+  const int before = Tracer::live.load();
+  try {
+    axe_buffer<Tracer, 4> buf;
+    buf.push_back(1);
+    buf.push_back(2);
+    {
+      auto w = buf.writer_lock(3); // reserve 3 tail slots
+      w[0].emplace(10);
+      w[1].emplace(Tracer::kBoom); // throws; only slot 0 (value 10) is committed
+      w[2].emplace(12);            // never reached
+    }
+  } catch (const std::exception &) {
+    // expected: the ctor threw and propagated out
+  }
+  REQUIRE(Tracer::live.load() == before); // nothing unconstructed was destroyed
+}
+
+//----------------------------------------------------------------------------
+// A partially filled reserved range must not publish unwritten slots.
+// writer_lock(3) reserves three slots but only slot 0 is written; commit
+// publishes just that prefix, so the unwritten cells never enter the live
+// window and teardown never destroys them.
+//----------------------------------------------------------------------------
+TEST_CASE("partial fill must not publish unwritten slots") {
+  const int before = Tracer::live.load();
+  {
+    axe_buffer<Tracer, 8> buf;
+    {
+      auto w = buf.writer_lock(3); // reserve 3 slots on a fresh buffer
+      w[0].emplace(1);             // only slot 0 written; slots 1,2 left unwritten
+    }                              // commit publishes only the constructed prefix
+
+    // The live window is exactly the one written slot — not three.
+    auto win = buf.unsafe_window();
+    std::vector<int> got;
+    for (size_t seg = 0; seg < win.segs.block_cnt(); ++seg)
+      for (Tracer *p = win.segs[seg].begin(); p != win.segs[seg].end(); ++p)
+        got.push_back(p->v);
+    REQUIRE(got == (std::vector<int>{1}));
+  }
+  REQUIRE(Tracer::live.load() == before); // teardown destroyed only the one live cell
+}
+
+//----------------------------------------------------------------------------
+// A throwing element constructor during an in-place *reuse* (overwriting a slot
+// in a full ring) must not corrupt the buffer. The reuse path builds the
+// replacement in a temporary first, so the throw leaves the existing object
+// untouched: no double-destroy, no leak, and the buffer stays usable.
+//----------------------------------------------------------------------------
+static std::vector<int> window_of(axe_buffer<Tracer, 4> &buf) {
+  auto win = buf.unsafe_window();
+  std::vector<int> got;
+  for (size_t seg = 0; seg < win.segs.block_cnt(); ++seg)
+    for (Tracer *p = win.segs[seg].begin(); p != win.segs[seg].end(); ++p)
+      got.push_back(p->v);
+  return got;
+}
+
+TEST_CASE("throwing ctor during in-place reuse must not corrupt the buffer") {
+  const int before = Tracer::live.load();
+  {
+    axe_buffer<Tracer, 4> buf;
+    for (int i = 0; i < 4; ++i)
+      buf.push_back(i); // fill the ring: live window {0,1,2,3}
+    REQUIRE(Tracer::live.load() == before + 4);
+    REQUIRE(window_of(buf) == (std::vector<int>{0, 1, 2, 3}));
+
+    // Overwrite two slots (both reuse, ring is full); the second throws.
+    try {
+      auto w = buf.writer_lock(2);
+      w[0].emplace(10);            // reuse: succeeds, oldest (0,1) freed for room
+      w[1].emplace(Tracer::kBoom); // reuse: throws while building the temporary
+    } catch (const std::exception &) {
+      // expected
+    }
+
+    // No corruption: the throwing reuse left its slot's old object intact, so
+    // exactly S objects are still live, and only the one successful overwrite
+    // is published.
+    REQUIRE(Tracer::live.load() == before + 4);
+    REQUIRE(window_of(buf) == (std::vector<int>{2, 3, 10}));
+
+    // Buffer is still fully usable afterwards.
+    buf.push_back(20);
+    REQUIRE(Tracer::live.load() == before + 4);
+    REQUIRE(window_of(buf) == (std::vector<int>{2, 3, 10, 20}));
+  }
+  REQUIRE(Tracer::live.load() == before); // teardown reclaimed every cell
 }
 
 //=============================================================================

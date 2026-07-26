@@ -11,6 +11,7 @@
 #include <mutex>
 #include <new>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace axe {
@@ -236,7 +237,13 @@ private:
 };
 
 // ---- axe_buffer<T, S, word_t> ----------------------------------------------
-enum class read_result { ok, empty, lapped };
+// ok/empty/lapped are the outcomes of an ordinary read. would_overwrite is
+// returned only by the guarded read read(out, min_margin): the item exists and
+// is not yet lapped, but it has fewer than min_margin writes of headroom before
+// the writer could reuse its slot, so the read was declined and the cursor left
+// in place. It is distinct from lapped (already gone) — the caller decides
+// whether to back off, widen the ring, or accept the item via the plain read().
+enum class read_result { ok, empty, lapped, would_overwrite };
 
 template <typename T, size_t S, typename word_t = uint64_t> class axe_buffer {
   static_assert(S > 0, "axe_buffer size must be > 0");
@@ -265,12 +272,14 @@ public:
 
   axe_buffer() : added_(0), freed_(0) {}
   ~axe_buffer() {
-    // Constructed cells are exactly indices [0, live count): warmup fills
-    // 0,1,2,… in order and never frees, and once full the count is S, covering
-    // every slot.
+    // Constructed cells form the prefix [0, constructed_count_): warmup fills
+    // 0,1,2,… in order (freed stays 0 until full), and once full every reuse
+    // reconstructs in place, so the set never develops a gap. We destroy by the
+    // explicit count rather than the live-window size, because a partial or
+    // aborted lock can leave freed ahead of what was actually added — the live
+    // window then understates how many cells are constructed.
     if constexpr (!std::is_trivially_copyable_v<T>) {
-      const size_t n = live_relaxed().size();
-      for (size_t i = 0; i < n; ++i)
+      for (size_t i = 0; i < constructed_count_; ++i)
         cells_[i].destroy();
     }
   }
@@ -286,6 +295,7 @@ public:
   // readers on commit() or when the handle leaves scope.
   writer_range writer_lock(size_t n) {
     mutex_.lock();
+    staged_ = 0; // reset the per-lock construction counter (mutex-protected)
     range_t live = live_relaxed();
 
     if (n > S)
@@ -376,12 +386,19 @@ public:
       return buf_->stage_slot(span_.at(static_cast<word_t>(i)), was_full_);
     }
 
-    // Idempotent; runs on scope exit. span_.end() is the new added count; one
-    // release store publishes every staged cell write that precedes it.
+    // Idempotent; runs on scope exit. Publishes only the contiguous prefix of
+    // slots that were actually constructed (staged_), not the full reserved
+    // span: a partial fill or an exception mid-lock therefore never exposes an
+    // unwritten cell to readers. One release store publishes every staged cell
+    // write that precedes it. (staged_ is capped at the span so an accidental
+    // over-write past the reservation cannot advance added_ beyond it.)
     void commit() {
       if (!buf_ || committed_)
         return;
-      buf_->added_.store(span_.end().val(), std::memory_order_release);
+      const size_t filled =
+          buf_->staged_ < span_.size() ? buf_->staged_ : span_.size();
+      const added_t end = span_.begin() + added_t(static_cast<word_t>(filled));
+      buf_->added_.store(end.val(), std::memory_order_release);
       committed_ = true;
       buf_->mutex_.unlock();
     }
@@ -425,6 +442,54 @@ public:
 
       if (signed_distance(freed, pos_) < 0) {
         pos_ = freed;
+        return read_result::lapped;
+      }
+      pos_ = pos_ + added_t(1);
+      return read_result::ok;
+    }
+
+    // Headroom, in writes, before the item at the cursor (the next one read()
+    // would return) could be overwritten: signed_distance(freed, cursor). It is
+    // the item's depth above the reclaim edge — 0 for the oldest live item,
+    // up to S-1 for the newest, negative once lapped. This is a snapshot that
+    // can only shrink as the writer advances; the library holds no clock, so a
+    // caller with a bounded read/processing time and a max write rate converts
+    // its own time budget into a write-count margin (see DESIGN.md §3). Works
+    // for any T (it inspects only the counters, never the cells).
+    std::make_signed_t<word_t> remaining_writes() const {
+      const added_t freed{buf_->freed_.load(std::memory_order_acquire)};
+      return signed_distance(freed, pos_);
+    }
+
+    // Guarded read: like read(out), but declines with would_overwrite (leaving
+    // the cursor put) when the cursor's item has fewer than min_margin writes of
+    // headroom. An already-lapped cursor still reports lapped and resyncs. The
+    // seqlock still guarantees the copy is untorn, so min_margin is purely the
+    // caller's temporal policy — it never affects correctness for trivial T,
+    // only which items are handed back. Trivially-copyable T only.
+    read_result read(T &out, word_t min_margin) {
+      static_assert(std::is_trivially_copyable_v<T>,
+                    "reader::read requires trivially-copyable T; use "
+                    "unsafe_window otherwise");
+      const added_t added{buf_->added_.load(std::memory_order_acquire)};
+      if (pos_ == added)
+        return read_result::empty;
+
+      const added_t freed{buf_->freed_.load(std::memory_order_acquire)};
+      const auto margin = signed_distance(freed, pos_);
+      if (margin < 0) { // already reclaimed
+        pos_ = freed;
+        return read_result::lapped;
+      }
+      if (static_cast<word_t>(margin) < min_margin)
+        return read_result::would_overwrite; // exists, but too close to the edge
+
+      const size_t idx = pos_.val() % S;
+      atomic_load_bytes(&out, buf_->cells_[idx].mem, sizeof(T));
+      std::atomic_thread_fence(std::memory_order_acquire);
+      const added_t freed2{buf_->freed_.load(std::memory_order_relaxed)};
+      if (signed_distance(freed2, pos_) < 0) {
+        pos_ = freed2;
         return read_result::lapped;
       }
       pos_ = pos_ + added_t(1);
@@ -516,20 +581,45 @@ private:
   template <typename... Args> T &construct_cell(size_t idx, bool reuse, Args &&...args) {
     if constexpr (std::is_trivially_copyable_v<T>) {
       (void)reuse;
-      T tmp(std::forward<Args>(args)...);
+      T tmp(std::forward<Args>(args)...); // may throw before anything is published
       atomic_store_bytes(cells_[idx].mem, &tmp, sizeof(T));
+      ++staged_; // count only after a successful store
       return cells_[idx].ref();
     } else {
-      if (reuse)
-        cells_[idx].destroy();
-      return cells_[idx].emplace(std::forward<Args>(args)...);
+      static_assert(std::is_move_constructible_v<T> ||
+                        std::is_copy_constructible_v<T>,
+                    "non-trivial axe_buffer element must be move- or "
+                    "copy-constructible: the ring overwrites cells on wrap");
+      if (!reuse) {
+        // Fresh slot: nothing to destroy, so a throw is already safe — neither
+        // counter has advanced and no existing object was touched.
+        T &ref = cells_[idx].emplace(std::forward<Args>(args)...);
+        ++constructed_count_; // grows over [0, S) in warmup, then pinned at S
+        ++staged_;
+        return ref;
+      }
+      // Reuse overwrites in place, so the old object must be destroyed before
+      // the new one occupies the same address. Build the replacement in a
+      // temporary FIRST: a throwing element constructor then leaves the existing
+      // object untouched (strong guarantee — no half-overwritten hole for
+      // teardown or a later reuse to trip over). Only once the temporary exists
+      // do we destroy and move it in; move_if_noexcept keeps that final step
+      // non-throwing whenever T has a noexcept move or a copy — i.e. for
+      // effectively every broadcastable type.
+      T tmp(std::forward<Args>(args)...); // throw => cell unchanged, not counted
+      cells_[idx].destroy();
+      T &ref = cells_[idx].emplace(std::move_if_noexcept(tmp));
+      ++staged_;
+      return ref;
     }
   }
 
   std::array<naked_block<T>, S> cells_{};
-  std::atomic<word_t> added_; // committed sequence count (mod M)
-  std::atomic<word_t> freed_; // freed sequence count     (mod M)
-  std::mutex mutex_;          // serialises writers
+  std::atomic<word_t> added_;    // committed sequence count (mod M)
+  std::atomic<word_t> freed_;    // freed sequence count     (mod M)
+  std::mutex mutex_;             // serialises writers
+  size_t constructed_count_ = 0; // # constructed cells = prefix [0, count); teardown only
+  size_t staged_ = 0;            // successful constructs in the current lock; mutex-protected
 };
 
 } // namespace axe
