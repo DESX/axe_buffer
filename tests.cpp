@@ -3,8 +3,8 @@
 // Build:  make            (downloads clang + Catch2, then runs this suite)
 //
 // Reading order: the first cases are runnable usage examples — start at the top
-// to learn the API. The low-level component tests (modular arithmetic, ranges,
-// views) live at the bottom under "INTERNALS".
+// to learn the API. The low-level component tests (construction, views) live at
+// the bottom under "INTERNALS".
 //=============================================================================
 #include "catch_amalgamated.hpp"
 #include <axe_buffer.hpp> // resolves to the generated, versioned header
@@ -13,18 +13,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <deque>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
 using namespace axe;
-
-// mod_range exposes begin()/end(), so Catch2 mistakes it for an iterable range
-// and tries to print it by dereferencing mod_int (which isn't an iterator).
-// Opt it out of range-stringification; it falls back to "{?}" on failure.
-namespace Catch {
-template <typename W, W M> struct is_range<axe::mod_range<W, M>> : std::false_type {};
-} // namespace Catch
 
 //=============================================================================
 // USAGE EXAMPLES
@@ -33,13 +27,13 @@ template <typename W, W M> struct is_range<axe::mod_range<W, M>> : std::false_ty
 //----------------------------------------------------------------------------
 // EXAMPLE 1 — the whole API at a glance.
 //
-// axe_buffer<T, S> is a fixed-capacity, single-writer / many-reader broadcast
-// ring. The writer appends; once full, appending overwrites the oldest item.
+// axe_buffer<T>(capacity) is a fixed-capacity, single-writer / many-reader
+// broadcast ring. The writer appends; once full, appending overwrites the oldest.
 // Every reader sees every item it doesn't fall behind on, and readers never
 // block the writer.
 //----------------------------------------------------------------------------
 TEST_CASE("example: producer / consumer at a glance") {
-  axe_buffer<int, 4> buf; // a ring holding up to 4 ints
+  axe_buffer<int> buf(4); // a ring holding up to 4 ints
 
   // --- writing ---------------------------------------------------------
   buf.push_back(1); // append a single item
@@ -88,7 +82,7 @@ TEST_CASE("example: producer / consumer at a glance") {
 //----------------------------------------------------------------------------
 TEST_CASE("single-threaded FIFO + overwrite") {
   constexpr size_t S = 4;
-  axe_buffer<int, S> buf;
+  axe_buffer<int> buf(S);
   std::deque<int> mirror;
 
   auto push = [&](int v) {
@@ -111,7 +105,7 @@ TEST_CASE("single-threaded FIFO + overwrite") {
 //----------------------------------------------------------------------------
 TEST_CASE("reader cursor: ok / empty / lapped") {
   constexpr size_t S = 4;
-  axe_buffer<int, S> buf;
+  axe_buffer<int> buf(S);
   for (int v = 0; v < 4; ++v)
     buf.push_back(v); // [0,1,2,3]
 
@@ -149,7 +143,7 @@ TEST_CASE("reader cursor: ok / empty / lapped") {
 //----------------------------------------------------------------------------
 TEST_CASE("temporal: remaining_writes + guarded read") {
   constexpr size_t S = 8;
-  axe_buffer<int, S> buf;
+  axe_buffer<int> buf(S);
   for (int i = 0; i < 8; ++i)
     buf.push_back(i); // full: freed=0, added=8, so item i sits at depth i
 
@@ -173,7 +167,7 @@ TEST_CASE("temporal: remaining_writes + guarded read") {
 
   // would_overwrite is an early warning distinct from lapped: as the writer
   // advances, the same item crosses from "too close" to "already gone".
-  axe_buffer<int, 4> b2;
+  axe_buffer<int> b2(4);
   for (int i = 0; i < 4; ++i)
     b2.push_back(i);
   auto r2 = b2.new_reader();                            // oldest, depth 0
@@ -187,7 +181,7 @@ TEST_CASE("temporal: remaining_writes + guarded read") {
 // EXAMPLE 4 — multi-slot writer_lock(N) + iterator emplace.
 //----------------------------------------------------------------------------
 TEST_CASE("multi-slot writer_lock + iterator emplace") {
-  axe_buffer<int, 8> buf;
+  axe_buffer<int> buf(8);
   {
     auto w = buf.writer_lock(3);
     REQUIRE(w.size() == 3);
@@ -210,7 +204,7 @@ TEST_CASE("multi-slot writer_lock + iterator emplace") {
 // the mutex; the scope-exit commit is then an idempotent no-op.
 //----------------------------------------------------------------------------
 TEST_CASE("writer_range explicit early commit") {
-  axe_buffer<int, 8> buf;
+  axe_buffer<int> buf(8);
   {
     auto w = buf.writer_lock(2);
     w[0] = 7;
@@ -241,7 +235,7 @@ TEST_CASE("SPMC stress: 1 writer + N readers") {
   constexpr uint64_t TOTAL = 500000;
   constexpr int READERS = 4;
 
-  axe_buffer<sample, S> buf;
+  axe_buffer<sample> buf(S);
   std::atomic<bool> done{false};
   std::atomic<uint64_t> total_ok{0};
   std::atomic<int> torn{0};
@@ -314,7 +308,7 @@ std::atomic<int> Counted::live{0};
 TEST_CASE("non-trivial T: lifetime + leak check") {
   REQUIRE(Counted::live.load() == 0);
   {
-    axe_buffer<Counted, 4> buf;
+    axe_buffer<Counted> buf(4);
     for (int i = 0; i < 20; ++i)
       buf.push_back(i); // many destroy-before-reuse cycles
     // at most S live cells exist at once
@@ -342,7 +336,7 @@ TEST_CASE("non-trivial T: lifetime + leak check") {
 TEST_CASE("non-trivial T: multi-slot lock across warmup->full boundary") {
   REQUIRE(Counted::live.load() == 0);
   {
-    axe_buffer<Counted, 4> buf;
+    axe_buffer<Counted> buf(4);
 
     // Warmup: stage 3 (no free yet); slots 0,1,2 constructed once each.
     {
@@ -421,7 +415,7 @@ std::atomic<int> Tracer::live{0};
 TEST_CASE("throwing ctor mid-lock must not corrupt the buffer") {
   const int before = Tracer::live.load();
   try {
-    axe_buffer<Tracer, 4> buf;
+    axe_buffer<Tracer> buf(4);
     buf.push_back(1);
     buf.push_back(2);
     {
@@ -445,7 +439,7 @@ TEST_CASE("throwing ctor mid-lock must not corrupt the buffer") {
 TEST_CASE("partial fill must not publish unwritten slots") {
   const int before = Tracer::live.load();
   {
-    axe_buffer<Tracer, 8> buf;
+    axe_buffer<Tracer> buf(8);
     {
       auto w = buf.writer_lock(3); // reserve 3 slots on a fresh buffer
       w[0].emplace(1);             // only slot 0 written; slots 1,2 left unwritten
@@ -468,7 +462,7 @@ TEST_CASE("partial fill must not publish unwritten slots") {
 // replacement in a temporary first, so the throw leaves the existing object
 // untouched: no double-destroy, no leak, and the buffer stays usable.
 //----------------------------------------------------------------------------
-static std::vector<int> window_of(axe_buffer<Tracer, 4> &buf) {
+static std::vector<int> window_of(axe_buffer<Tracer> &buf) {
   auto win = buf.unsafe_window();
   std::vector<int> got;
   for (size_t seg = 0; seg < win.segs.block_cnt(); ++seg)
@@ -480,7 +474,7 @@ static std::vector<int> window_of(axe_buffer<Tracer, 4> &buf) {
 TEST_CASE("throwing ctor during in-place reuse must not corrupt the buffer") {
   const int before = Tracer::live.load();
   {
-    axe_buffer<Tracer, 4> buf;
+    axe_buffer<Tracer> buf(4);
     for (int i = 0; i < 4; ++i)
       buf.push_back(i); // fill the ring: live window {0,1,2,3}
     REQUIRE(Tracer::live.load() == before + 4);
@@ -511,98 +505,28 @@ TEST_CASE("throwing ctor during in-place reuse must not corrupt the buffer") {
 
 //=============================================================================
 // INTERNALS — low-level components the ring is built from. Not needed to use
-// axe_buffer; here to pin down the modular-arithmetic edge cases.
+// axe_buffer; here to pin down construction and the view helpers.
 //=============================================================================
 
 //----------------------------------------------------------------------------
-// modulo arithmetic core
+// runtime capacity: set at construction, reported by capacity(), 0 rejected;
+// non-power-of-two sizes wrap and overwrite like any other.
 //----------------------------------------------------------------------------
-TEST_CASE("modulo arithmetic core") {
-  REQUIRE(is_power_of_2<uint8_t>(1));
-  REQUIRE(is_power_of_2<uint8_t>(128));
-  REQUIRE(!is_power_of_2<uint8_t>(0));
-  REQUIRE(!is_power_of_2<uint8_t>(6));
-  REQUIRE(!is_power_of_2<uint8_t>(255));
+TEST_CASE("runtime capacity") {
+  axe_buffer<int> buf(6);
+  REQUIRE(buf.capacity() == 6);
+  REQUIRE_THROWS_AS(axe_buffer<int>(0), std::invalid_argument);
 
-  REQUIRE(max_multiple<uint8_t>(1) == 0);
-  REQUIRE(max_multiple<uint8_t>(2) == 0); // power of 2 -> natural overflow
-  REQUIRE(max_multiple<uint8_t>(3) == 255);
-  REQUIRE(max_multiple<uint8_t>(10) == 250);
-  REQUIRE(max_multiple<uint8_t>(100) == 200);
+  axe_buffer<int> odd(3); // not a power of two
+  for (int v = 0; v < 7; ++v)
+    odd.push_back(v); // 0..6 through a 3-slot ring
+  REQUIRE(odd.snapshot() == (std::vector<int>{4, 5, 6}));
 
-  mod_int<uint8_t, 10> v = 4;
-  REQUIRE((++v) == 5);
-  REQUIRE((v++) == 5);
-  REQUIRE(v == 6);
-  v += 2;
-  REQUIRE(v == 8);
-  v += 2;
-  REQUIRE(v == 0);
-  v -= 1;
-  REQUIRE(v.val() == 9);
-
-  // wrap-aware addition on non-power-of-2 modulus
-  mod_int<uint8_t, 10> r = 9;
-  r += 255;
-  REQUIRE(r.val() == 4);
-
-  mod_index<uint8_t, 5> idx = (uint8_t)22;
-  REQUIRE(idx.val() == 22);
-  REQUIRE(idx.index() == 2);
-  ++idx;
-  REQUIRE(idx.index() == 3);
-
-  // signed_distance — modular and natural-overflow
-  using mi = mod_int<uint32_t, 1000>;
-  REQUIRE(signed_distance(mi(100), mi(150)) == 50);
-  REQUIRE(signed_distance(mi(150), mi(100)) == -50);
-  REQUIRE(signed_distance(mi(990), mi(10)) == 20); // across wrap
-  using nat = mod_int<uint32_t, 0>;
-  REQUIRE(signed_distance(nat(0xFFFFFFFEu), nat(2u)) == 4);
-}
-
-//----------------------------------------------------------------------------
-// mod_range — pair of mod_ints as a half-open buffer range
-//----------------------------------------------------------------------------
-TEST_CASE("mod_range half-open buffer range") {
-  using rng = mod_range<uint32_t, 1000>;
-  using mi = mod_int<uint32_t, 1000>;
-
-  rng r(mi(10), mi(15)); // [10, 15)
-  REQUIRE(r.size() == 5);
-  REQUIRE(!r.empty());
-  REQUIRE(r.begin() == mi(10));
-  REQUIRE(r.end() == mi(15));
-  REQUIRE(r.contains(mi(10)));
-  REQUIRE(r.contains(mi(14)));
-  REQUIRE(!r.contains(mi(15))); // end is exclusive
-  REQUIRE(!r.contains(mi(9)));
-  REQUIRE(r.offset(mi(12)) == 2);
-  REQUIRE(r.at(3) == mi(13));
-
-  // empty range
-  REQUIRE(rng(mi(7), mi(7)).empty());
-  REQUIRE(rng(mi(7), mi(7)).size() == 0);
-
-  // from_length and the advance helpers (freeing front / committing back)
-  rng f = rng::from_length(mi(998), 5); // [998, 3) across the wrap
-  REQUIRE(f.size() == 5);
-  REQUIRE(f.contains(mi(999)));
-  REQUIRE(f.contains(mi(0)));
-  REQUIRE(f.contains(mi(2)));
-  REQUIRE(!f.contains(mi(3)));
-  REQUIRE(f.offset(mi(0)) == 2);
-  REQUIRE(f.advanced_begin(2) == rng(mi(0), mi(3))); // freed 2 from front
-  REQUIRE(f.advanced_end(2) == rng(mi(998), mi(5))); // committed 2 at back
-
-  // natural-overflow modulus (mod_val == 0) wraps at 2^32
-  using rng0 = mod_range<uint32_t, 0>;
-  using mi0 = mod_int<uint32_t, 0>;
-  rng0 w = rng0::from_length(mi0(0xFFFFFFFEu), 4); // [..FE, 2)
-  REQUIRE(w.size() == 4);
-  REQUIRE(w.contains(mi0(0xFFFFFFFFu)));
-  REQUIRE(w.contains(mi0(1u)));
-  REQUIRE(!w.contains(mi0(2u)));
+  auto r = odd.new_reader();
+  int x;
+  REQUIRE(r.remaining_writes() == 0); // oldest, depth 0
+  REQUIRE((r.read(x) == read_result::ok && x == 4));
+  REQUIRE(r.remaining_writes() == 1);
 }
 
 //----------------------------------------------------------------------------

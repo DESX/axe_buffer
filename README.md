@@ -27,7 +27,7 @@ beyond the standard library.
 #include <axe_buffer.hpp>
 using namespace axe;
 
-axe_buffer<int, 4> buf;   // ring holding up to 4 ints
+axe_buffer<int> buf(4);   // ring holding up to 4 ints; capacity is a runtime arg
 ```
 
 Append single items. Once the ring is full, each append drops the oldest item.
@@ -93,7 +93,7 @@ if (r.read(x, 8) == read_result::would_overwrite) {
 Store non-trivial types and read them by reference.
 
 ```cpp
-axe_buffer<std::string, 16> log;
+axe_buffer<std::string> log(16);
 log.push_back("hello");
 
 auto win = log.unsafe_window();          // up to two contiguous segments, no copy
@@ -107,15 +107,17 @@ if (!log.still_valid(win.word)) {
 
 ## Broadcast SPMC ring
 
-`axe_buffer<T, S, word_t = uint64_t>` is a fixed-capacity ring of `S` cells. A
-single writer appends; the mutex serializes writers, so multiple writer threads
-are allowed but only one is active at a time. Every reader receives every item it
-does not fall behind on. Readers are independent: consuming from one cursor does
-not affect any other.
+`axe_buffer<T>` is a fixed-capacity ring; capacity is a constructor argument
+(`axe_buffer<T> buf(n)`), so it can come from a config file rather than a
+template parameter. A single writer appends; the mutex serializes writers, so
+multiple writer threads are allowed but only one is active at a time. Every
+reader receives every item it does not fall behind on. Readers are independent:
+consuming from one cursor does not affect any other.
 
-State is two monotonic counters, `added_` (committed) and `freed_` (reclaimed).
-The live window is the half-open range `[freed_, added_)`. `capacity()` returns
-`S`; `value_type` is `T`.
+State is two monotonic 64-bit counters, `added_` (committed) and `freed_`
+(reclaimed). The live window is the half-open range `[freed_, added_)`.
+`capacity()` returns the size; `value_type` is `T`. A capacity of 0 throws
+`std::invalid_argument`.
 
 ## Wait-free passive readers
 
@@ -194,7 +196,7 @@ the caller converts its own read-time budget and write-rate bound into a
 write-count margin.
 
 * `reader::remaining_writes()` returns the headroom, in writes, before the
-  cursor's item is reclaimed: `0` for the oldest live item, up to `S-1` for the
+  cursor's item is reclaimed: `0` for the oldest live item, up to `capacity-1` for the
   newest, negative once lapped. It inspects only the counters, so it is available
   for any `T`.
 * `reader::read(out, min_margin)` is a guarded read. It returns `ok` only when
@@ -208,16 +210,19 @@ is about to be overwritten, not a report that it already was.
 
 ## Counter core and configuration
 
-`word_t` (default `uint64_t`) is the unsigned counter type. Both counters run
-over modulus `M`, the largest multiple of `S` that fits `word_t` (`0` means
-natural wraparound, used for power-of-two `S`), so `pos % S` stays exact across
-the wrap. `S` must satisfy `S <= max(word_t) / 2` so the ring can tell forward
-from backward within half the modulus.
+Capacity is a runtime constructor argument of any positive value; it need not be
+a power of two. Cells live in one heap allocation (`unique_ptr<...[]>`) sized at
+construction and never resized, so the buffer is a single-process, multi-thread
+object (not placed in shared memory).
 
-A narrower `word_t` shrinks the header footprint but also the safe read window:
-lap detection assumes the writer cannot advance by `M/2` during one read. With
-`uint64_t` this is unreachable in practice; with a small `word_t` under heavy
-lapping it is a real bound.
+The two sequence counters are `uint64_t` and increment naturally, wrapping at
+`2^64`. A cell index is `pos % capacity`. Because the counters never wrap in
+practice (`2^64` writes is centuries away at any real rate), that modulo is exact
+for every capacity. Runtime capacity means the modulo is a real hardware divide;
+a power-of-two capacity is not required but lets some compilers and the reader
+avoid the division. Lap detection uses the signed difference of two counters and
+is correct while positions stay within `2^63` of each other, which the live
+window (at most `capacity`) always satisfies.
 
 ## Build
 
