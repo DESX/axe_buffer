@@ -96,10 +96,10 @@ Store non-trivial types and read them by reference.
 axe_buffer<std::string> log(16);
 log.push_back("hello");
 
-auto win = log.unsafe_window();          // up to two contiguous segments, no copy
-for (size_t s = 0; s < win.segs.block_cnt(); ++s)
-  for (std::string* p = win.segs[s].begin(); p != win.segs[s].end(); ++p)
-    ; // use *p
+auto win = log.unsafe_window();          // up to two contiguous std::span<T>, no copy
+for (auto seg : win.segs)
+  for (std::string& s : seg)
+    ; // use s
 if (!log.still_valid(win.word)) {
   // writer lapped the region during use; discard the result
 }

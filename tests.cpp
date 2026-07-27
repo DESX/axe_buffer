@@ -317,9 +317,9 @@ TEST_CASE("non-trivial T: lifetime + leak check") {
     // unsafe reference window (quiescent writer): contents are the last 4
     auto win = buf.unsafe_window();
     std::vector<int> got;
-    for (size_t seg = 0; seg < win.segs.block_cnt(); ++seg)
-      for (Counted *p = win.segs[seg].begin(); p != win.segs[seg].end(); ++p)
-        got.push_back(p->v);
+    for (auto seg : win.segs)
+      for (auto &c : seg)
+        got.push_back(c.v);
     REQUIRE(buf.still_valid(win.word));
     REQUIRE(got == (std::vector<int>{16, 17, 18, 19}));
   }
@@ -360,9 +360,9 @@ TEST_CASE("non-trivial T: multi-slot lock across warmup->full boundary") {
     // Live window is the last 4: positions 2,3,4,5 -> values 2,10,11,12.
     auto win = buf.unsafe_window();
     std::vector<int> got;
-    for (size_t seg = 0; seg < win.segs.block_cnt(); ++seg)
-      for (Counted *p = win.segs[seg].begin(); p != win.segs[seg].end(); ++p)
-        got.push_back(p->v);
+    for (auto seg : win.segs)
+      for (auto &c : seg)
+        got.push_back(c.v);
     REQUIRE(got == (std::vector<int>{2, 10, 11, 12}));
   }
   REQUIRE(Counted::live.load() == 0); // teardown destroyed all live cells
@@ -448,9 +448,9 @@ TEST_CASE("partial fill must not publish unwritten slots") {
     // The live window is exactly the one written slot — not three.
     auto win = buf.unsafe_window();
     std::vector<int> got;
-    for (size_t seg = 0; seg < win.segs.block_cnt(); ++seg)
-      for (Tracer *p = win.segs[seg].begin(); p != win.segs[seg].end(); ++p)
-        got.push_back(p->v);
+    for (auto seg : win.segs)
+      for (auto &c : seg)
+        got.push_back(c.v);
     REQUIRE(got == (std::vector<int>{1}));
   }
   REQUIRE(Tracer::live.load() == before); // teardown destroyed only the one live cell
@@ -465,9 +465,9 @@ TEST_CASE("partial fill must not publish unwritten slots") {
 static std::vector<int> window_of(axe_buffer<Tracer> &buf) {
   auto win = buf.unsafe_window();
   std::vector<int> got;
-  for (size_t seg = 0; seg < win.segs.block_cnt(); ++seg)
-    for (Tracer *p = win.segs[seg].begin(); p != win.segs[seg].end(); ++p)
-      got.push_back(p->v);
+  for (auto seg : win.segs)
+      for (auto &c : seg)
+        got.push_back(c.v);
   return got;
 }
 
@@ -527,19 +527,6 @@ TEST_CASE("runtime capacity") {
   REQUIRE(r.remaining_writes() == 0); // oldest, depth 0
   REQUIRE((r.read(x) == read_result::ok && x == 4));
   REQUIRE(r.remaining_writes() == 1);
-}
-
-//----------------------------------------------------------------------------
-// multi-segment view
-//----------------------------------------------------------------------------
-TEST_CASE("multi-segment view") {
-  mdata_view<char, 2> d;
-  char a[5] = {'a', 'b', 'c', 'd', 'e'};
-  char b[3] = {'f', 'g', 'h'};
-  d[0] = {a, sizeof(a)};
-  d[1] = {b, sizeof(b)};
-  REQUIRE(d.size() == 8);
-  REQUIRE(d.to_vec() == (std::vector<char>{'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'}));
 }
 
 //----------------------------------------------------------------------------
