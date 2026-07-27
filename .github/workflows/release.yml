@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  # Full gauntlet: the release is published only if every cell here passes, so
+  # the release notes' "all tests passed" claim is gated, not decorative.
+  verify:
+    name: verify / ${{ matrix.os }} / ${{ matrix.cxx }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        cxx: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential clang git
+      - name: Build and test
+        run: make test SYS_CXX=${{ matrix.cxx }}
+
+  sanitize:
+    name: ${{ matrix.san }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        san: [thread, "address,undefined"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential clang git
+      - name: Build and run sanitizer
+        run: |
+          make test SYS_CXX=clang++
+          clang++ -std=c++20 -O1 -g -pthread \
+            -fsanitize=${{ matrix.san }} -fno-sanitize-recover=all \
+            -Ibuild/include -Ibuild/catch2/extras \
+            tests.cpp build/catch2/extras/catch_amalgamated.cpp -o tests_san
+          TSAN_OPTIONS=halt_on_error=1 ./tests_san
+
+  publish:
+    name: publish release
+    needs: [verify, sanitize]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential git
+      - name: Generate versioned single-header
+        run: |
+          make header
+          echo "Stamped version:"
+          grep -m1 AXE_BUFFER_VERSION build/include/axe_buffer.hpp
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/include/axe_buffer.hpp
+          generate_release_notes: true
+          body: |
+            Single-header build of **axe_buffer ${{ github.ref_name }}** (`axe_buffer.hpp`,
+            with `axe::version` baked in).
+
+            All tests passed on the release matrix: x86-64 + aarch64, gcc + clang,
+            plus ThreadSanitizer and ASan/UBSan on both architectures.

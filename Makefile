@@ -19,12 +19,21 @@ VTOOL_GIT_URL := https://github.com/DESX/version_tool.git
 $(eval $(call GRAFT_FETCH,VTOOL))
 VT := $(VTOOL_TGT)
 
-# Modern clang for later C++26-reflection experiments; this repo only needs C++20.
-CLANG_DIR     := $b/clang
+# Toolchain. By default graft fetches a pinned clang (Linux x86-64), which also
+# provides clang-tidy / clang-format. Set SYS_CXX (e.g. `make test SYS_CXX=g++`)
+# to build with a system compiler instead — used by CI and on non-x86 hosts.
+# lint / format still require the default graft clang.
+CLANG_DIR := $b/clang
+ifeq ($(strip $(SYS_CXX)),)
 CLANG_TGT     := $(CLANG_DIR)/bin/clang++
 CLANG_TAR_URL := https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-Linux-X64.tar.xz
 $(eval $(call GRAFT_FETCH,CLANG))
-CXX      := $(CLANG_TGT)
+CXX     := $(CLANG_TGT)
+CXX_DEP := $(CLANG_TGT)
+else
+CXX     := $(SYS_CXX)
+CXX_DEP :=
+endif
 CXXFLAGS := -std=c++20 -O2 -pthread
 
 CATCH2_DIR     := $b/catch2
@@ -43,11 +52,11 @@ $(GEN_HDR): axe_buffer.hpp $(VTOOL_TGT) | $b/include
 
 header: $(GEN_HDR)
 
-$b/catch_amalgamated.o: $(CATCH2_TGT) $(CLANG_TGT) | $b
+$b/catch_amalgamated.o: $(CATCH2_TGT) $(CXX_DEP) | $b
 	$(CXX) $(CXXFLAGS) $(CATCH2_INC) -c $(CATCH2_DIR)/extras/catch_amalgamated.cpp -o $@
 
 # <axe_buffer.hpp> (angle include) resolves to the generated, versioned header.
-$b/tests: tests.cpp $(GEN_HDR) $b/catch_amalgamated.o $(CLANG_TGT) | $b
+$b/tests: tests.cpp $(GEN_HDR) $b/catch_amalgamated.o $(CXX_DEP) | $b
 	$(CXX) $(CXXFLAGS) -I$b/include $(CATCH2_INC) tests.cpp $b/catch_amalgamated.o -o $@
 
 test: $b/tests

@@ -1,5 +1,8 @@
 # axe_buffer
 
+[![CI](https://github.com/DESX/axe_buffer/actions/workflows/ci.yml/badge.svg)](https://github.com/DESX/axe_buffer/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/DESX/axe_buffer)](https://github.com/DESX/axe_buffer/releases/latest)
+
 Single-header C++20 single-producer, multi-consumer (SPMC) broadcast ring. One
 writer appends fixed-capacity FIFO items; many readers each observe the full
 stream independently. When the ring fills, new items overwrite the oldest.
@@ -107,14 +110,14 @@ if (!log.still_valid(win.word)) {
 
 ## Broadcast SPMC ring
 
-`axe_buffer<T>` is a fixed-capacity ring; capacity is a constructor argument
-(`axe_buffer<T> buf(n)`), so it can come from a config file rather than a
-template parameter. A single writer appends; the mutex serializes writers, so
-multiple writer threads are allowed but only one is active at a time. Every
-reader receives every item it does not fall behind on. Readers are independent:
-consuming from one cursor does not affect any other.
+`axe_buffer<T, word_t = uint64_t>` is a fixed-capacity ring; capacity is a
+constructor argument (`axe_buffer<T> buf(n)`), so it can come from a config file
+rather than a template parameter. A single writer appends; the mutex serializes
+writers, so multiple writer threads are allowed but only one is active at a time.
+Every reader receives every item it does not fall behind on. Readers are
+independent: consuming from one cursor does not affect any other.
 
-State is two monotonic 64-bit counters, `added_` (committed) and `freed_`
+State is two monotonic `word_t` counters, `added_` (committed) and `freed_`
 (reclaimed). The live window is the half-open range `[freed_, added_)`.
 `capacity()` returns the size; `value_type` is `T`. A capacity of 0 throws
 `std::invalid_argument`.
@@ -215,14 +218,17 @@ a power of two. Cells live in one heap allocation (`unique_ptr<...[]>`) sized at
 construction and never resized, so the buffer is a single-process, multi-thread
 object (not placed in shared memory).
 
-The two sequence counters are `uint64_t` and increment naturally, wrapping at
-`2^64`. A cell index is `pos % capacity`. Because the counters never wrap in
-practice (`2^64` writes is centuries away at any real rate), that modulo is exact
-for every capacity. Runtime capacity means the modulo is a real hardware divide;
-a power-of-two capacity is not required but lets some compilers and the reader
-avoid the division. Lap detection uses the signed difference of two counters and
-is correct while positions stay within `2^63` of each other, which the live
-window (at most `capacity`) always satisfies.
+The two sequence counters have type `word_t` (default `uint64_t`) and run modulo
+`M`: the largest multiple of `capacity` that fits `word_t`, or natural `2^N` wrap
+when `capacity` is a power of two. Because `M` is a multiple of `capacity`, the
+cell index `pos % capacity` stays exact across the wrap, so the ring is correct
+for unbounded additions with any capacity, not just up to `2^64`. `word_t` must
+be unsigned and `capacity <= max(word_t) / 2` (lap detection compares positions
+within half the modulus). A smaller `word_t` shrinks the counters but tightens
+that bound: a reader that falls more than `M/2` writes behind before its next
+read can misjudge a lap, so small `word_t` suits keeping-up readers or bounded
+lag, not heavy concurrent lapping. `uint64_t` never wraps in practice, so the
+bound is moot there.
 
 ## Build
 

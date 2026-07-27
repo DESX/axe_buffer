@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  # Build and run the suite across two architectures and two compilers. aarch64
+  # is the point: x86-64's strong memory model cannot expose an acquire/release
+  # mistake, so a green ARM run is what validates the lock-free ordering.
+  test:
+    name: test / ${{ matrix.os }} / ${{ matrix.cxx }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        cxx: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # version_tool derives the version from git history/tags
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential clang git
+      - name: Cache graft downloads
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: graft-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Makefile') }}
+      - name: Build and test
+        run: make test SYS_CXX=${{ matrix.cxx }}
+
+  # ThreadSanitizer and ASan+UBSan, on both architectures. TSan on aarch64 is the
+  # strongest automated signal available for the seqlock's ordering.
+  sanitize:
+    name: ${{ matrix.san }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        san: [thread, "address,undefined"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential clang git
+      - name: Cache graft downloads
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: graft-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Makefile') }}
+      - name: Fetch deps + versioned header
+        run: make test SYS_CXX=clang++ # populates build/include and build/catch2, runs plain suite
+      - name: Build and run sanitizer
+        run: |
+          clang++ -std=c++20 -O1 -g -pthread \
+            -fsanitize=${{ matrix.san }} -fno-sanitize-recover=all \
+            -Ibuild/include -Ibuild/catch2/extras \
+            tests.cpp build/catch2/extras/catch_amalgamated.cpp -o tests_san
+          TSAN_OPTIONS=halt_on_error=1 ./tests_san

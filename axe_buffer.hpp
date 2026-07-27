@@ -6,16 +6,26 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <span>
 #include <stdexcept>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace axe {
+
+// Release version, stamped into the distributable header at build time (the
+// Makefile injects AXE_BUFFER_VERSION); a dev marker otherwise. Available both
+// as the macro and as axe::version.
+#ifndef AXE_BUFFER_VERSION
+#define AXE_BUFFER_VERSION "0.0.0-dev"
+#endif
+inline constexpr std::string_view version = AXE_BUFFER_VERSION;
 
 // Aligned uninitialised storage for one T, constructed/destroyed on demand.
 template <typename T> struct naked_block {
@@ -32,43 +42,59 @@ template <typename T> struct naked_block {
 // declined and the cursor left in place (distinct from lapped: already gone).
 enum class read_result { ok, empty, lapped, would_overwrite };
 
-template <typename T> class axe_buffer {
-  // Monotonic sequence counter; wraps at 2^64 (centuries away at any real rate,
-  // so pos % capacity is exact in practice for every capacity).
-  using pos_t = uint64_t;
+// word_t is the unsigned counter/position type. A wider type pushes the wrap
+// boundary further out; the default never wraps in practice. Smaller types wrap
+// often and are fully supported (and exercised by the unit tests).
+template <typename T, typename word_t = uint64_t> class axe_buffer {
+  static_assert(std::is_unsigned_v<word_t>, "word_t must be an unsigned integer");
 
   static size_t validate_capacity(size_t c) {
     if (c == 0)
       throw std::invalid_argument("axe_buffer capacity must be > 0");
+    if (c > static_cast<size_t>(std::numeric_limits<word_t>::max() / 2))
+      throw std::invalid_argument("axe_buffer capacity too large for word_t");
     return c;
   }
 
-  size_t index(pos_t p) const { return static_cast<size_t>(p % cap_); }
-
-  // Signed cyclic distance a->b; correct while |b - a| < 2^63, always true here
-  // (only positions within the live window, at most `capacity` apart, compare).
-  static int64_t signed_distance(pos_t a, pos_t b) {
-    return static_cast<int64_t>(b - a);
+  // Counters run modulo M_: the largest multiple of capacity that fits word_t,
+  // or 0 (natural 2^N wrap) when capacity is a power of two. A multiple of
+  // capacity keeps pos % capacity exact across the wrap.
+  static word_t compute_modulus(size_t cap) {
+    const word_t c = static_cast<word_t>(cap);
+    if ((c & static_cast<word_t>(c - 1)) == 0)
+      return 0; // power of two ⇒ natural word_t wrap already aligns
+    const word_t mx = std::numeric_limits<word_t>::max();
+    return static_cast<word_t>(mx - mx % c);
   }
 
-  // Half-open [begin, end) span of sequence positions (the live region, and each
-  // writer's staged span). Cell indexing happens via index() at access time.
-  struct range {
-    pos_t begin_ = 0;
-    pos_t end_ = 0;
-    static range from_length(pos_t begin, uint64_t len) { return {begin, begin + len}; }
-    pos_t begin() const { return begin_; }
-    pos_t end() const { return end_; }
-    uint64_t size() const { return end_ - begin_; }
-    bool empty() const { return begin_ == end_; }
-    pos_t at(uint64_t i) const { return begin_ + i; }
-    range advanced_begin(uint64_t n) const { return {begin_ + n, end_}; }
-  };
+  size_t index(word_t p) const { return static_cast<size_t>(p % static_cast<word_t>(cap_)); }
 
-  // Consistent because the writer holds the mutex and is the only mutator.
-  range live_relaxed() const {
-    return range{freed_.load(std::memory_order_relaxed),
-                 added_.load(std::memory_order_relaxed)};
+  // a + k (mod M_). On word_t overflow, gap_ re-aligns the wrap from 2^N to M_.
+  word_t add_mod(word_t a, word_t k) const {
+    if (M_ == 0)
+      return static_cast<word_t>(a + k);
+    word_t s = static_cast<word_t>(a + k);
+    if (s < a)
+      s = static_cast<word_t>(s + gap_);
+    return static_cast<word_t>(s % M_);
+  }
+
+  // (to - from) mod M_, in [0, M_): the forward gap, e.g. the live-window size.
+  word_t distance(word_t from, word_t to) const {
+    if (M_ == 0)
+      return static_cast<word_t>(to - from);
+    const word_t f = from % M_, t = to % M_;
+    return t >= f ? static_cast<word_t>(t - f) : static_cast<word_t>(M_ - (f - t));
+  }
+
+  // Signed cyclic distance a->b, in (-M_/2, M_/2] (or the word_t range when M_==0).
+  int64_t signed_dist(word_t a, word_t b) const {
+    if (M_ == 0)
+      return static_cast<int64_t>(
+          static_cast<std::make_signed_t<word_t>>(static_cast<word_t>(b - a)));
+    const word_t fwd = distance(a, b);
+    return fwd > M_ / 2 ? static_cast<int64_t>(fwd) - static_cast<int64_t>(M_)
+                        : static_cast<int64_t>(fwd);
   }
 
 public:
@@ -76,16 +102,18 @@ public:
   size_t capacity() const { return cap_; }
 
   explicit axe_buffer(size_t capacity)
-      : cap_(validate_capacity(capacity)),
+      : cap_(validate_capacity(capacity)), M_(compute_modulus(cap_)),
+        gap_(M_ ? static_cast<word_t>(std::numeric_limits<word_t>::max() - M_ + 1) : 0),
         cells_(std::make_unique<naked_block<T>[]>(cap_)), added_(0), freed_(0) {}
 
   ~axe_buffer() {
-    // Constructed cells are the prefix [0, constructed_count_): warmup fills
-    // 0,1,2,… and reuse reconstructs in place, so the set never gaps. Using the
-    // explicit count (not the live size) stays correct when a partial or aborted
-    // lock leaves freed ahead of added.
+    // Constructed cells are the prefix [0, live size): the free is per-cell (see
+    // construct_at), so freed never runs ahead of what was written and the
+    // constructed set never gaps. Live size = distance(freed, added).
     if constexpr (!std::is_trivially_copyable_v<T>) {
-      for (size_t i = 0; i < constructed_count_; ++i)
+      const size_t n = static_cast<size_t>(
+          distance(freed_.load(std::memory_order_relaxed), added_.load(std::memory_order_relaxed)));
+      for (size_t i = 0; i < n; ++i)
         cells_[i].destroy();
     }
   }
@@ -96,28 +124,13 @@ public:
   // ---- writer side --------------------------------------------------------
   class writer_range;
 
-  // Reserve n tail slots (freeing front space first when full). Returns a
-  // move-only RAII handle holding the writer mutex; slots become visible on
-  // commit() or when the handle leaves scope.
+  // Reserve n tail slots. Returns a move-only RAII handle holding the writer
+  // mutex; slots become visible on commit() or when the handle leaves scope.
   writer_range writer_lock(size_t n) {
     mutex_.lock();
-    staged_ = 0;
-    range live = live_relaxed();
     if (n > cap_)
       n = cap_; // clamp; n == 0 is a valid no-op
-
-    const size_t sz = static_cast<size_t>(live.size());
-    const bool was_full = (sz == cap_);
-    const size_t need_free = (sz + n > cap_) ? (sz + n - cap_) : 0;
-    if (need_free) {
-      // Free-before-write: publish the freed advance (release) and fence BEFORE
-      // any freed cell is overwritten, so a reader's post-copy freed load sees
-      // the advance and reports the tear.
-      live = live.advanced_begin(need_free);
-      freed_.store(live.begin(), std::memory_order_release);
-      std::atomic_thread_fence(std::memory_order_release);
-    }
-    return writer_range(*this, live.end(), n, was_full);
+    return writer_range(*this, added_.load(std::memory_order_relaxed), n);
   }
 
   template <typename... Args> void push_back(Args &&...args) {
@@ -127,50 +140,44 @@ public:
 
   class slot_proxy {
   public:
-    slot_proxy(axe_buffer &b, size_t idx, bool reuse) : buf_(b), idx_(idx), reuse_(reuse) {}
+    slot_proxy(axe_buffer &b, word_t pos, size_t *staged) : buf_(b), pos_(pos), staged_(staged) {}
     template <typename... Args> T &emplace(Args &&...args) {
-      return buf_.construct_cell(idx_, reuse_, std::forward<Args>(args)...);
+      T &r = buf_.construct_at(pos_, std::forward<Args>(args)...);
+      ++*staged_; // only on success; construct_at propagates a throw untouched
+      return r;
     }
     template <typename U> T &operator=(U &&v) { return emplace(std::forward<U>(v)); }
 
   private:
     axe_buffer &buf_;
-    size_t idx_;
-    bool reuse_;
+    word_t pos_;
+    size_t *staged_;
   };
-
-  // reuse ⇔ the target cell already holds a constructed object (destroyed first
-  // for non-trivial T): the ring was full at lock time, or this is a wrapped
-  // position. was_full pins reuse once the ring fills.
-  slot_proxy stage_slot(pos_t pos, bool was_full) {
-    return slot_proxy(*this, index(pos), was_full || pos >= cap_);
-  }
 
   class writer_range {
   public:
     class iterator {
     public:
-      iterator(axe_buffer &b, pos_t pos, bool was_full)
-          : buf_(&b), pos_(pos), was_full_(was_full) {}
+      iterator(axe_buffer &b, word_t pos, size_t *staged) : buf_(&b), pos_(pos), staged_(staged) {}
       bool operator!=(const iterator &o) const { return pos_ != o.pos_; }
       iterator &operator++() {
-        ++pos_;
+        pos_ = buf_->add_mod(pos_, 1);
         return *this;
       }
-      slot_proxy operator*() { return buf_->stage_slot(pos_, was_full_); }
+      slot_proxy operator*() { return slot_proxy(*buf_, pos_, staged_); }
 
     private:
       axe_buffer *buf_;
-      pos_t pos_;
-      bool was_full_;
+      word_t pos_;
+      size_t *staged_;
     };
 
-    writer_range(axe_buffer &b, pos_t start, size_t n, bool was_full)
-        : buf_(&b), span_(range::from_length(start, n)), was_full_(was_full) {}
+    writer_range(axe_buffer &b, word_t start, size_t n) : buf_(&b), start_(start), count_(n) {}
 
     // Move-only: owns the writer mutex and the commit obligation.
     writer_range(writer_range &&o) noexcept
-        : buf_(o.buf_), span_(o.span_), was_full_(o.was_full_), committed_(o.committed_) {
+        : buf_(o.buf_), start_(o.start_), count_(o.count_), staged_(o.staged_),
+          committed_(o.committed_) {
       o.buf_ = nullptr;
     }
     writer_range(const writer_range &) = delete;
@@ -178,29 +185,33 @@ public:
     writer_range &operator=(writer_range &&) = delete;
     ~writer_range() { commit(); }
 
-    size_t size() const { return static_cast<size_t>(span_.size()); }
-    iterator begin() const { return iterator(*buf_, span_.begin(), was_full_); }
-    iterator end() const { return iterator(*buf_, span_.end(), was_full_); }
-    slot_proxy operator[](size_t i) const { return buf_->stage_slot(span_.at(i), was_full_); }
+    size_t size() const { return count_; }
+    iterator begin() { return iterator(*buf_, start_, &staged_); }
+    iterator end() {
+      return iterator(*buf_, buf_->add_mod(start_, static_cast<word_t>(count_)), &staged_);
+    }
+    slot_proxy operator[](size_t i) {
+      return slot_proxy(*buf_, buf_->add_mod(start_, static_cast<word_t>(i)), &staged_);
+    }
 
     // Idempotent; runs on scope exit. Publishes only the contiguous prefix
-    // actually constructed (staged_, capped at the span), so a partial fill or a
-    // mid-lock exception never exposes an unwritten cell. One release store
-    // publishes every staged cell write that precedes it.
+    // actually constructed (staged_), so a partial fill or a mid-lock exception
+    // never exposes an unwritten cell. One release store publishes every staged
+    // cell write that precedes it.
     void commit() {
       if (!buf_ || committed_)
         return;
-      const uint64_t span = span_.size();
-      const uint64_t filled = buf_->staged_ < span ? buf_->staged_ : span;
-      buf_->added_.store(span_.begin() + filled, std::memory_order_release);
+      buf_->added_.store(buf_->add_mod(start_, static_cast<word_t>(staged_)),
+                         std::memory_order_release);
       committed_ = true;
       buf_->mutex_.unlock();
     }
 
   private:
     axe_buffer *buf_;
-    range span_;
-    bool was_full_;
+    word_t start_;
+    size_t count_;
+    size_t staged_ = 0;
     bool committed_ = false;
   };
 
@@ -220,17 +231,17 @@ public:
     read_result read(T &out) {
       static_assert(std::is_trivially_copyable_v<T>,
                     "reader::read requires trivially-copyable T; use unsafe_window otherwise");
-      const pos_t added = buf_->added_.load(std::memory_order_acquire);
+      const word_t added = buf_->added_.load(std::memory_order_acquire);
       if (pos_ == added)
         return read_result::empty;
       atomic_load_bytes(&out, buf_->cells_[buf_->index(pos_)].mem, sizeof(T));
       std::atomic_thread_fence(std::memory_order_acquire);
-      const pos_t freed = buf_->freed_.load(std::memory_order_relaxed);
-      if (signed_distance(freed, pos_) < 0) {
+      const word_t freed = buf_->freed_.load(std::memory_order_relaxed);
+      if (buf_->signed_dist(freed, pos_) < 0) {
         pos_ = freed;
         return read_result::lapped;
       }
-      ++pos_;
+      pos_ = buf_->add_mod(pos_, 1);
       return read_result::ok;
     }
 
@@ -239,7 +250,7 @@ public:
     // The library holds no clock; the caller turns its own read-time budget and
     // write-rate bound into this write-count margin (DESIGN.md §3). Any T.
     int64_t remaining_writes() const {
-      return signed_distance(buf_->freed_.load(std::memory_order_acquire), pos_);
+      return buf_->signed_dist(buf_->freed_.load(std::memory_order_acquire), pos_);
     }
 
     // Guarded read: declines with would_overwrite (cursor unmoved) when the item
@@ -249,11 +260,11 @@ public:
     read_result read(T &out, uint64_t min_margin) {
       static_assert(std::is_trivially_copyable_v<T>,
                     "reader::read requires trivially-copyable T; use unsafe_window otherwise");
-      const pos_t added = buf_->added_.load(std::memory_order_acquire);
+      const word_t added = buf_->added_.load(std::memory_order_acquire);
       if (pos_ == added)
         return read_result::empty;
-      const pos_t freed = buf_->freed_.load(std::memory_order_acquire);
-      const int64_t margin = signed_distance(freed, pos_);
+      const word_t freed = buf_->freed_.load(std::memory_order_acquire);
+      const int64_t margin = buf_->signed_dist(freed, pos_);
       if (margin < 0) {
         pos_ = freed;
         return read_result::lapped;
@@ -262,18 +273,18 @@ public:
         return read_result::would_overwrite;
       atomic_load_bytes(&out, buf_->cells_[buf_->index(pos_)].mem, sizeof(T));
       std::atomic_thread_fence(std::memory_order_acquire);
-      const pos_t freed2 = buf_->freed_.load(std::memory_order_relaxed);
-      if (signed_distance(freed2, pos_) < 0) {
+      const word_t freed2 = buf_->freed_.load(std::memory_order_relaxed);
+      if (buf_->signed_dist(freed2, pos_) < 0) {
         pos_ = freed2;
         return read_result::lapped;
       }
-      ++pos_;
+      pos_ = buf_->add_mod(pos_, 1);
       return read_result::ok;
     }
 
   private:
     axe_buffer *buf_;
-    pos_t pos_ = 0;
+    word_t pos_ = 0;
   };
 
   reader new_reader() { return reader(*this); }
@@ -283,15 +294,16 @@ public:
     static_assert(std::is_trivially_copyable_v<T>,
                   "snapshot requires trivially-copyable T; use unsafe_window otherwise");
     for (;;) {
-      const pos_t f1 = freed_.load(std::memory_order_acquire); // freed first ⇒ added >= f1
-      const pos_t added = added_.load(std::memory_order_acquire);
-      const range live{f1, added};
-      const uint64_t n = live.size();
+      const word_t f1 = freed_.load(std::memory_order_acquire); // freed first ⇒ added >= f1
+      const word_t added = added_.load(std::memory_order_acquire);
+      const word_t n = distance(f1, added);
       std::vector<T> out(static_cast<size_t>(n));
-      for (uint64_t k = 0; k < n; ++k)
-        atomic_load_bytes(&out[static_cast<size_t>(k)], cells_[index(live.at(k))].mem, sizeof(T));
+      for (word_t k = 0; k < n; ++k)
+        atomic_load_bytes(&out[static_cast<size_t>(k)], cells_[index(add_mod(f1, k))].mem,
+                          sizeof(T));
       std::atomic_thread_fence(std::memory_order_acquire);
-      if (freed_.load(std::memory_order_relaxed) == f1) // unchanged ⇒ nothing was reclaimed mid-copy
+      if (freed_.load(std::memory_order_relaxed) ==
+          f1) // unchanged ⇒ nothing was reclaimed mid-copy
         return out;
     }
   }
@@ -302,19 +314,18 @@ public:
   // Call still_valid(word) AFTER use to detect (not prevent) a lap.
   struct unsafe_view {
     std::array<std::span<T>, 2> segs;
-    uint64_t word;
+    word_t word;
   };
 
   unsafe_view unsafe_window() {
-    const pos_t f = freed_.load(std::memory_order_acquire);
-    const pos_t added = added_.load(std::memory_order_acquire);
-    const range live{f, added};
+    const word_t f = freed_.load(std::memory_order_acquire);
+    const word_t added = added_.load(std::memory_order_acquire);
     T *const base = reinterpret_cast<T *>(cells_.get()); // naked_block<T> aliases T storage
-    const size_t a = index(live.begin());
-    const size_t b = index(live.end());
+    const size_t a = index(f);
+    const size_t b = index(added);
     unsafe_view uv;
     uv.word = f; // a lap can only advance freed
-    if (live.empty()) {
+    if (f == added) {
     } else if (a < b) {
       uv.segs[0] = std::span<T>(base + a, base + b);
     } else {
@@ -324,7 +335,7 @@ public:
     return uv;
   }
 
-  bool still_valid(uint64_t observed) const {
+  bool still_valid(word_t observed) const {
     return freed_.load(std::memory_order_acquire) == observed;
   }
 
@@ -344,41 +355,43 @@ private:
       d[i] = std::atomic_ref<unsigned char>(s[i]).load(std::memory_order_relaxed);
   }
 
-  // Trivial T: race-free byte store. Non-trivial T: placement-new for a fresh
-  // slot, or build-a-temporary-then-move-in-place for reuse so a throwing
-  // element constructor cannot leave a destroyed hole. staged_/constructed_count_
-  // advance only after a successful construction.
-  template <typename... Args> T &construct_cell(size_t idx, bool reuse, Args &&...args) {
+  // Write one cell. reuse (the ring is full at this position) evicts the oldest
+  // first: free-before-write publishes freed (release) and fences BEFORE the
+  // overwrite, so a reader's post-copy freed load sees the advance and reports
+  // the tear. For non-trivial T the replacement is built first, so a throwing
+  // element constructor leaves the existing object and freed untouched.
+  template <typename... Args> T &construct_at(word_t pos, Args &&...args) {
+    const word_t f = freed_.load(std::memory_order_relaxed);
+    const bool reuse = distance(f, pos) >= static_cast<word_t>(cap_);
+    const size_t idx = index(pos);
     if constexpr (std::is_trivially_copyable_v<T>) {
-      (void)reuse;
-      T tmp(std::forward<Args>(args)...); // may throw before anything is published
+      T tmp(std::forward<Args>(args)...); // may throw before anything changes
+      if (reuse) {
+        freed_.store(add_mod(f, 1), std::memory_order_release);
+        std::atomic_thread_fence(std::memory_order_release);
+      }
       atomic_store_bytes(cells_[idx].mem, &tmp, sizeof(T));
-      ++staged_;
       return cells_[idx].ref();
     } else {
       static_assert(std::is_move_constructible_v<T> || std::is_copy_constructible_v<T>,
                     "non-trivial axe_buffer element must be move- or copy-constructible");
-      if (!reuse) {
-        T &ref = cells_[idx].emplace(std::forward<Args>(args)...);
-        ++constructed_count_;
-        ++staged_;
-        return ref;
-      }
+      if (!reuse)
+        return cells_[idx].emplace(std::forward<Args>(args)...);
       T tmp(std::forward<Args>(args)...); // build first: a throw leaves the old object intact
+      freed_.store(add_mod(f, 1), std::memory_order_release);
+      std::atomic_thread_fence(std::memory_order_release);
       cells_[idx].destroy();
-      T &ref = cells_[idx].emplace(std::move_if_noexcept(tmp));
-      ++staged_;
-      return ref;
+      return cells_[idx].emplace(std::move_if_noexcept(tmp));
     }
   }
 
   const size_t cap_;                        // fixed capacity, set at construction
+  const word_t M_;                          // counter modulus (0 = natural wrap)
+  const word_t gap_;                        // word_t-overflow correction for add_mod
   std::unique_ptr<naked_block<T>[]> cells_; // one heap allocation, never resized
-  std::atomic<pos_t> added_;                // committed sequence count
-  std::atomic<pos_t> freed_;                // freed sequence count
+  std::atomic<word_t> added_;               // committed sequence count
+  std::atomic<word_t> freed_;               // freed sequence count
   std::mutex mutex_;                        // serialises writers
-  size_t constructed_count_ = 0;            // # constructed cells = prefix [0, count); teardown
-  size_t staged_ = 0;                       // successful constructs in the current lock
 };
 
 } // namespace axe

@@ -170,7 +170,7 @@ TEST_CASE("temporal: remaining_writes + guarded read") {
   axe_buffer<int> b2(4);
   for (int i = 0; i < 4; ++i)
     b2.push_back(i);
-  auto r2 = b2.new_reader();                            // oldest, depth 0
+  auto r2 = b2.new_reader();                              // oldest, depth 0
   REQUIRE(r2.read(x, 2) == read_result::would_overwrite); // 0 < 2: declined, not consumed
   b2.push_back(4);                                        // freed advances past the cursor
   REQUIRE(r2.read(x, 2) == read_result::lapped);          // now genuinely gone; resynced
@@ -443,7 +443,7 @@ TEST_CASE("partial fill must not publish unwritten slots") {
     {
       auto w = buf.writer_lock(3); // reserve 3 slots on a fresh buffer
       w[0].emplace(1);             // only slot 0 written; slots 1,2 left unwritten
-    }                              // commit publishes only the constructed prefix
+    } // commit publishes only the constructed prefix
 
     // The live window is exactly the one written slot — not three.
     auto win = buf.unsafe_window();
@@ -466,8 +466,8 @@ static std::vector<int> window_of(axe_buffer<Tracer> &buf) {
   auto win = buf.unsafe_window();
   std::vector<int> got;
   for (auto seg : win.segs)
-      for (auto &c : seg)
-        got.push_back(c.v);
+    for (auto &c : seg)
+      got.push_back(c.v);
   return got;
 }
 
@@ -483,17 +483,17 @@ TEST_CASE("throwing ctor during in-place reuse must not corrupt the buffer") {
     // Overwrite two slots (both reuse, ring is full); the second throws.
     try {
       auto w = buf.writer_lock(2);
-      w[0].emplace(10);            // reuse: succeeds, oldest (0,1) freed for room
+      w[0].emplace(10);            // reuse: succeeds, evicts oldest (0)
       w[1].emplace(Tracer::kBoom); // reuse: throws while building the temporary
     } catch (const std::exception &) {
       // expected
     }
 
-    // No corruption: the throwing reuse left its slot's old object intact, so
-    // exactly S objects are still live, and only the one successful overwrite
-    // is published.
+    // No corruption: exactly S objects are still live. The free is per-cell, so
+    // the throwing slot evicted nothing: value 1 survives (only value 0 was
+    // dropped, for the one successful overwrite). Window = {1, 2, 3, 10}.
     REQUIRE(Tracer::live.load() == before + 4);
-    REQUIRE(window_of(buf) == (std::vector<int>{2, 3, 10}));
+    REQUIRE(window_of(buf) == (std::vector<int>{1, 2, 3, 10}));
 
     // Buffer is still fully usable afterwards.
     buf.push_back(20);
@@ -501,6 +501,173 @@ TEST_CASE("throwing ctor during in-place reuse must not corrupt the buffer") {
     REQUIRE(window_of(buf) == (std::vector<int>{2, 3, 10, 20}));
   }
   REQUIRE(Tracer::live.load() == before); // teardown reclaimed every cell
+}
+
+//=============================================================================
+// CONCURRENCY & EDGE COVERAGE
+//=============================================================================
+
+//----------------------------------------------------------------------------
+// Multiple writer threads. The mutex serialises writers, so every committed
+// item is well-formed: concurrent readers must never see a torn value, and the
+// items from any one writer stay in that writer's order (between laps).
+//----------------------------------------------------------------------------
+TEST_CASE("multi-writer: serialised, no torn reads") {
+  constexpr size_t S = 128;
+  constexpr int WRITERS = 3;
+  constexpr int READERS = 3;
+  constexpr uint32_t PER_WRITER = 150000;
+
+  struct tagged {
+    uint32_t wid;
+    uint32_t seq;
+    uint64_t chk;
+  };
+  auto chk_of = [](uint32_t wid, uint32_t seq) {
+    return mix((static_cast<uint64_t>(wid) << 32) | seq);
+  };
+
+  axe_buffer<tagged> buf(S);
+  std::atomic<bool> done{false};
+  std::atomic<int> torn{0}, regress{0};
+  std::atomic<uint64_t> total_ok{0};
+
+  auto reader_fn = [&]() {
+    auto r = buf.new_reader();
+    uint32_t last[WRITERS];
+    bool have[WRITERS] = {};
+    uint64_t oks = 0;
+    for (;;) {
+      tagged t;
+      read_result rr = r.read(t);
+      if (rr == read_result::ok) {
+        if (t.chk != chk_of(t.wid, t.seq))
+          torn.fetch_add(1);
+        else if (t.wid < WRITERS) {
+          if (have[t.wid] && t.seq <= last[t.wid])
+            regress.fetch_add(1); // a single writer's items must not go backwards
+          last[t.wid] = t.seq;
+          have[t.wid] = true;
+        }
+        ++oks;
+      } else if (rr == read_result::lapped) {
+        for (bool &h : have)
+          h = false; // per-writer order only holds within an unlapped run
+      } else if (done.load(std::memory_order_acquire)) {
+        break;
+      } else {
+        std::this_thread::yield();
+      }
+    }
+    total_ok.fetch_add(oks);
+  };
+
+  std::vector<std::thread> readers, writers;
+  for (int i = 0; i < READERS; ++i)
+    readers.emplace_back(reader_fn);
+  for (int w = 0; w < WRITERS; ++w)
+    writers.emplace_back([&, w]() {
+      for (uint32_t s = 0; s < PER_WRITER; ++s)
+        buf.push_back(tagged{static_cast<uint32_t>(w), s, chk_of(static_cast<uint32_t>(w), s)});
+    });
+  for (auto &t : writers)
+    t.join();
+  done.store(true, std::memory_order_release);
+  for (auto &t : readers)
+    t.join();
+
+  REQUIRE(torn.load() == 0);
+  REQUIRE(regress.load() == 0);
+  REQUIRE(total_ok.load() > 0);
+}
+
+//----------------------------------------------------------------------------
+// Degenerate capacities: 1 and 2 must still be correct FIFO/overwrite rings.
+//----------------------------------------------------------------------------
+TEST_CASE("edge capacities: 1 and 2") {
+  for (size_t cap : {size_t{1}, size_t{2}}) {
+    axe_buffer<int> buf(cap);
+    std::deque<int> mirror;
+    for (int v = 0; v < 20; ++v) {
+      buf.push_back(v);
+      mirror.push_back(v);
+      while (mirror.size() > cap)
+        mirror.pop_front();
+      std::vector<int> snap = buf.snapshot();
+      REQUIRE(snap.size() == mirror.size());
+      REQUIRE(std::equal(snap.begin(), snap.end(), mirror.begin()));
+    }
+    auto r = buf.new_reader();
+    int x;
+    REQUIRE((r.read(x) == read_result::ok && x == 20 - static_cast<int>(cap))); // oldest live
+  }
+}
+
+//----------------------------------------------------------------------------
+// Large, over-aligned T: the heap allocation must honour alignof(T), and the
+// per-byte seqlock must never admit a torn value at size under load.
+//----------------------------------------------------------------------------
+TEST_CASE("large over-aligned T under load") {
+  struct alignas(64) wide {
+    uint64_t seq;
+    uint64_t chk;
+    char pad[112]; // sizeof == 128, alignof == 64
+  };
+  static_assert(sizeof(wide) == 128 && alignof(wide) == 64);
+
+  { // the allocation is over-aligned
+    axe_buffer<wide> probe(4);
+    wide w{};
+    w.seq = 0;
+    w.chk = mix(0);
+    probe.push_back(w);
+    auto win = probe.unsafe_window();
+    REQUIRE(win.segs[0].size() == 1);
+    REQUIRE(reinterpret_cast<uintptr_t>(win.segs[0].data()) % alignof(wide) == 0);
+  }
+
+  constexpr size_t S = 64;
+  constexpr uint64_t TOTAL = 50000;
+  axe_buffer<wide> buf(S);
+  std::atomic<bool> done{false};
+  std::atomic<int> torn{0};
+  std::atomic<uint64_t> total_ok{0};
+
+  auto reader_fn = [&]() {
+    auto r = buf.new_reader();
+    wide w;
+    uint64_t oks = 0;
+    for (;;) {
+      read_result rr = r.read(w);
+      if (rr == read_result::ok) {
+        if (w.chk != mix(w.seq))
+          torn.fetch_add(1);
+        ++oks;
+      } else if (rr == read_result::empty) {
+        if (done.load(std::memory_order_acquire))
+          break;
+        std::this_thread::yield();
+      }
+      // lapped: resynced, keep going
+    }
+    total_ok.fetch_add(oks);
+  };
+
+  std::vector<std::thread> readers;
+  for (int i = 0; i < 2; ++i)
+    readers.emplace_back(reader_fn);
+  for (uint64_t s = 0; s < TOTAL; ++s) {
+    wide w{};
+    w.seq = s;
+    w.chk = mix(s);
+    buf.push_back(w);
+  }
+  done.store(true, std::memory_order_release);
+  for (auto &t : readers)
+    t.join();
+
+  REQUIRE(torn.load() == 0);
+  REQUIRE(total_ok.load() > 0);
 }
 
 //=============================================================================
@@ -527,6 +694,45 @@ TEST_CASE("runtime capacity") {
   REQUIRE(r.remaining_writes() == 0); // oldest, depth 0
   REQUIRE((r.read(x) == read_result::ok && x == 4));
   REQUIRE(r.remaining_writes() == 1);
+}
+
+//----------------------------------------------------------------------------
+// A narrow counter type (uint8_t) wraps its sequence counter every M additions,
+// so pushing well past M exercises modular add / distance / index / signed
+// distance across the wrap. Both a non-power-of-two capacity (runtime modulus M
+// = 255) and a power-of-two capacity (natural 2^8 wrap, M = 0) are checked
+// against a std::deque mirror, plus a keeping-up reader that must stay in FIFO
+// order across the wrap. Stored values are full ints; only positions wrap.
+//----------------------------------------------------------------------------
+TEST_CASE("uint8_t counter wraps reliably") {
+  auto run = [](size_t cap) {
+    axe_buffer<int, uint8_t> buf(cap);
+    std::deque<int> mirror;
+    auto r = buf.new_reader();
+    int got;
+    for (int v = 0; v < 900; ++v) { // ~3 full modulus wraps
+      buf.push_back(v);
+      mirror.push_back(v);
+      while (mirror.size() > cap)
+        mirror.pop_front();
+      std::vector<int> snap = buf.snapshot();
+      REQUIRE(snap.size() == mirror.size());
+      REQUIRE(std::equal(snap.begin(), snap.end(), mirror.begin()));
+      // one push, one read: the reader is never lapped and stays in order.
+      REQUIRE((r.read(got) == read_result::ok && got == v));
+      REQUIRE(r.read(got) == read_result::empty);
+    }
+    // Falling behind by more than capacity laps, then resyncs to the oldest.
+    // Last value pushed is 901+cap, so the oldest of the final `cap` items is
+    // (901+cap) - (cap-1) = 902, independent of capacity.
+    for (int v = 900; v <= 901 + static_cast<int>(cap); ++v)
+      buf.push_back(v);
+    REQUIRE(r.read(got) == read_result::lapped);
+    REQUIRE((r.read(got) == read_result::ok && got == 902));
+  };
+
+  run(3); // runtime modulus M = 255
+  run(8); // natural 2^8 wrap, M = 0
 }
 
 //----------------------------------------------------------------------------
