@@ -61,7 +61,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential git
       - name: Generate versioned single-header
         run: |
-          make header
+          make header VERSION=${{ github.ref_name }}
           echo "Stamped version:"
           grep -m1 AXE_BUFFER_VERSION build/include/axe_buffer.hpp
       - name: Publish GitHub Release

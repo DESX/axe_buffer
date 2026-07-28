@@ -44,9 +44,12 @@ $(eval $(call GRAFT_FETCH,CATCH2))
 CATCH2_INC := -I$(CATCH2_DIR)/extras
 
 # Distributable header = source + one injected #define AXE_BUFFER_VERSION.
+# VERSION overrides the stamped string (releases pass the exact tag, e.g.
+# VERSION=v1.2.3); otherwise it is derived from git via version_tool.
 GEN_HDR := $b/include/axe_buffer.hpp
+VERSION ?=
 $(GEN_HDR): axe_buffer.hpp $(VTOOL_TGT) | $b/include
-	@v=`'$(VT)' -C . 2>/dev/null || echo v0.0.0`; \
+	@v="$(VERSION)"; [ -n "$$v" ] || v=`'$(VT)' -C . 2>/dev/null || echo v0.0.0`; \
 	 sed "1a #define AXE_BUFFER_VERSION \"$$v\"" $< > $@; \
 	 echo "  VERSION  $$v"
 
