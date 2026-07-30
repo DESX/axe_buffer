@@ -48,26 +48,28 @@ enum class read_result { ok, empty, lapped, would_overwrite };
 template <typename T, typename word_t = uint64_t> class axe_buffer {
   static_assert(std::is_unsigned_v<word_t>, "word_t must be an unsigned integer");
 
-  static size_t validate_capacity(size_t c) {
+  // size_t in, word_t out: the size_t parameter lets validation reject an
+  // oversized capacity (a word_t parameter would silently truncate it), while
+  // storing word_t keeps capacity in the same space as positions internally.
+  static word_t validate_capacity(size_t c) {
     if (c == 0)
       throw std::invalid_argument("axe_buffer capacity must be > 0");
     if (c > static_cast<size_t>(std::numeric_limits<word_t>::max() / 2))
       throw std::invalid_argument("axe_buffer capacity too large for word_t");
-    return c;
+    return static_cast<word_t>(c);
   }
 
   // Counters run modulo M_: the largest multiple of capacity that fits word_t,
   // or 0 (natural 2^N wrap) when capacity is a power of two. A multiple of
   // capacity keeps pos % capacity exact across the wrap.
-  static word_t compute_modulus(size_t cap) {
-    const word_t c = static_cast<word_t>(cap);
+  static word_t compute_modulus(word_t c) {
     if ((c & static_cast<word_t>(c - 1)) == 0)
       return 0; // power of two ⇒ natural word_t wrap already aligns
     const word_t mx = std::numeric_limits<word_t>::max();
     return static_cast<word_t>(mx - mx % c);
   }
 
-  size_t index(word_t p) const { return static_cast<size_t>(p % static_cast<word_t>(cap_)); }
+  size_t index(word_t p) const { return static_cast<size_t>(p % cap_); }
 
   // a + k (mod M_). On word_t overflow, gap_ re-aligns the wrap from 2^N to M_.
   word_t add_mod(word_t a, word_t k) const {
@@ -140,7 +142,7 @@ public:
 
   class slot_proxy {
   public:
-    slot_proxy(axe_buffer &b, word_t pos, size_t *staged) : buf_(b), pos_(pos), staged_(staged) {}
+    slot_proxy(axe_buffer &b, word_t pos, word_t *staged) : buf_(b), pos_(pos), staged_(staged) {}
     template <typename... Args> T &emplace(Args &&...args) {
       T &r = buf_.construct_at(pos_, std::forward<Args>(args)...);
       ++*staged_; // only on success; construct_at propagates a throw untouched
@@ -151,14 +153,14 @@ public:
   private:
     axe_buffer &buf_;
     word_t pos_;
-    size_t *staged_;
+    word_t *staged_;
   };
 
   class writer_range {
   public:
     class iterator {
     public:
-      iterator(axe_buffer &b, word_t pos, size_t *staged) : buf_(&b), pos_(pos), staged_(staged) {}
+      iterator(axe_buffer &b, word_t pos, word_t *staged) : buf_(&b), pos_(pos), staged_(staged) {}
       bool operator!=(const iterator &o) const { return pos_ != o.pos_; }
       iterator &operator++() {
         pos_ = buf_->add_mod(pos_, 1);
@@ -169,10 +171,11 @@ public:
     private:
       axe_buffer *buf_;
       word_t pos_;
-      size_t *staged_;
+      word_t *staged_;
     };
 
-    writer_range(axe_buffer &b, word_t start, size_t n) : buf_(&b), start_(start), count_(n) {}
+    writer_range(axe_buffer &b, word_t start, size_t n)
+        : buf_(&b), start_(start), count_(static_cast<word_t>(n)) {}
 
     // Move-only: owns the writer mutex and the commit obligation.
     writer_range(writer_range &&o) noexcept
@@ -187,9 +190,7 @@ public:
 
     size_t size() const { return count_; }
     iterator begin() { return iterator(*buf_, start_, &staged_); }
-    iterator end() {
-      return iterator(*buf_, buf_->add_mod(start_, static_cast<word_t>(count_)), &staged_);
-    }
+    iterator end() { return iterator(*buf_, buf_->add_mod(start_, count_), &staged_); }
     slot_proxy operator[](size_t i) {
       return slot_proxy(*buf_, buf_->add_mod(start_, static_cast<word_t>(i)), &staged_);
     }
@@ -201,8 +202,7 @@ public:
     void commit() {
       if (!buf_ || committed_)
         return;
-      buf_->added_.store(buf_->add_mod(start_, static_cast<word_t>(staged_)),
-                         std::memory_order_release);
+      buf_->added_.store(buf_->add_mod(start_, staged_), std::memory_order_release);
       committed_ = true;
       buf_->mutex_.unlock();
     }
@@ -210,8 +210,8 @@ public:
   private:
     axe_buffer *buf_;
     word_t start_;
-    size_t count_;
-    size_t staged_ = 0;
+    word_t count_;
+    word_t staged_ = 0;
     bool committed_ = false;
   };
 
@@ -362,7 +362,7 @@ private:
   // element constructor leaves the existing object and freed untouched.
   template <typename... Args> T &construct_at(word_t pos, Args &&...args) {
     const word_t f = freed_.load(std::memory_order_relaxed);
-    const bool reuse = distance(f, pos) >= static_cast<word_t>(cap_);
+    const bool reuse = distance(f, pos) >= cap_;
     const size_t idx = index(pos);
     if constexpr (std::is_trivially_copyable_v<T>) {
       T tmp(std::forward<Args>(args)...); // may throw before anything changes
@@ -385,7 +385,7 @@ private:
     }
   }
 
-  const size_t cap_;                        // fixed capacity, set at construction
+  const word_t cap_;                        // fixed capacity, set at construction
   const word_t M_;                          // counter modulus (0 = natural wrap)
   const word_t gap_;                        // word_t-overflow correction for add_mod
   std::unique_ptr<naked_block<T>[]> cells_; // one heap allocation, never resized
